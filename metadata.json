@@ -1,0 +1,8 @@
+{
+  "name": "Remix GELORA 26 - Lomba Literasi \u0026 Numerasi SMPN 26 Sijunjung",
+  "description": "Aplikasi resmi Lomba Literasi dan Numerasi GELORA 26 SMP Negeri 26 Sijunjung dengan realtime cloud score, multi-babak, dan beragam tipe soal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

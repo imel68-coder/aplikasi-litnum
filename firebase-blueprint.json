@@ -1,0 +1,206 @@
+{
+  "entities": {
+    "AppState": {
+      "title": "AppState",
+      "description": "Global state of the competition such as active stage and announcements",
+      "type": "object",
+      "properties": {
+        "activeStageId": {
+          "type": "string",
+          "description": "Currently active competition stage"
+        },
+        "stages": {
+          "type": "object",
+          "description": "Configuration dictionary of competition stages"
+        },
+        "announcement": {
+          "type": "string",
+          "description": "Announcement broadcasted to participants"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Timestamp when state was last updated"
+        }
+      },
+      "required": ["activeStageId"]
+    },
+    "Student": {
+      "title": "Student",
+      "description": "Student participant data",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique student identifier"
+        },
+        "noPeserta": {
+          "type": "string",
+          "description": "Competition registration number e.g. G26-001"
+        },
+        "nama": {
+          "type": "string",
+          "description": "Full name of the student"
+        },
+        "sekolah": {
+          "type": "string",
+          "description": "School name"
+        },
+        "kelas": {
+          "type": "string",
+          "description": "Class / Grade"
+        },
+        "pin": {
+          "type": "string",
+          "description": "Login PIN for exam"
+        },
+        "qualifiedStage": {
+          "type": "string",
+          "description": "Highest stage student is qualified for"
+        },
+        "status": {
+          "type": "string",
+          "description": "Competition status (aktif, lolos, gugur, selesai)"
+        }
+      },
+      "required": ["id", "noPeserta", "nama", "qualifiedStage", "status"]
+    },
+    "Question": {
+      "title": "Question",
+      "description": "Exam question definition",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique question ID"
+        },
+        "stageId": {
+          "type": "string",
+          "description": "Stage ID where this question belongs"
+        },
+        "order": {
+          "type": "number",
+          "description": "Sequence order within the stage"
+        },
+        "type": {
+          "type": "string",
+          "description": "Question type: pg_single, pg_complex, true_false, matching"
+        },
+        "category": {
+          "type": "string",
+          "description": "Category: literasi or numerasi"
+        },
+        "stimulusText": {
+          "type": "string",
+          "description": "Reading text stimulus or case description"
+        },
+        "imageUrl": {
+          "type": "string",
+          "description": "Optional illustration image URL"
+        },
+        "questionPrompt": {
+          "type": "string",
+          "description": "Question prompt text"
+        },
+        "points": {
+          "type": "number",
+          "description": "Score weight for this question"
+        }
+      },
+      "required": ["id", "stageId", "order", "type", "category", "questionPrompt", "points"]
+    },
+    "Submission": {
+      "title": "Submission",
+      "description": "Student answer submission for a question",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique submission ID"
+        },
+        "studentId": {
+          "type": "string",
+          "description": "Student who answered"
+        },
+        "stageId": {
+          "type": "string",
+          "description": "Competition stage"
+        },
+        "questionId": {
+          "type": "string",
+          "description": "Question ID"
+        },
+        "type": {
+          "type": "string",
+          "description": "Question type"
+        },
+        "isCorrect": {
+          "type": "boolean",
+          "description": "Whether the answer was fully correct"
+        },
+        "scoreEarned": {
+          "type": "number",
+          "description": "Points earned for this answer"
+        },
+        "submittedAt": {
+          "type": "number",
+          "description": "Timestamp when submitted"
+        }
+      },
+      "required": ["id", "studentId", "stageId", "questionId", "scoreEarned", "submittedAt"]
+    },
+    "StudentProgress": {
+      "title": "StudentProgress",
+      "description": "Student progress record for a stage",
+      "type": "object",
+      "properties": {
+        "studentId": {
+          "type": "string",
+          "description": "Student ID"
+        },
+        "stageId": {
+          "type": "string",
+          "description": "Stage ID"
+        },
+        "completedQuestionIds": {
+          "type": "array",
+          "description": "List of question IDs completed"
+        },
+        "totalScore": {
+          "type": "number",
+          "description": "Total score accumulated in this stage"
+        },
+        "isFinished": {
+          "type": "boolean",
+          "description": "Whether the student finished the stage"
+        },
+        "finishedAt": {
+          "type": "number",
+          "description": "Timestamp when finished"
+        }
+      },
+      "required": ["studentId", "stageId", "totalScore", "isFinished"]
+    }
+  },
+  "firestore": {
+    "/app_state/{docId}": {
+      "schema": "AppState",
+      "description": "Global competition state configuration"
+    },
+    "/students/{studentId}": {
+      "schema": "Student",
+      "description": "Collection of participating students"
+    },
+    "/questions/{questionId}": {
+      "schema": "Question",
+      "description": "Collection of competition questions"
+    },
+    "/submissions/{submissionId}": {
+      "schema": "Submission",
+      "description": "Collection of student answer submissions"
+    },
+    "/student_progress/{progressId}": {
+      "schema": "StudentProgress",
+      "description": "Collection of student stage progress tracking"
+    }
+  }
+}

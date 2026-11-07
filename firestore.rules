@@ -1,0 +1,45 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    // App State collection
+    match /app_state/{docId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Students collection
+    match /students/{studentId} {
+      allow read: if true;
+      allow write: if isValidId(studentId);
+    }
+
+    // Questions collection
+    match /questions/{questionId} {
+      allow read: if true;
+      allow write: if isValidId(questionId);
+    }
+
+    // Submissions collection
+    match /submissions/{submissionId} {
+      allow read: if true;
+      allow write: if isValidId(submissionId);
+    }
+
+    // Student Progress collection
+    match /student_progress/{progressId} {
+      allow read: if true;
+      allow write: if isValidId(progressId);
+    }
+
+    // Default deny for any other path
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
