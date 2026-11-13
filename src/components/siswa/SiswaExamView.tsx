@@ -6,7 +6,7 @@ import {
   HelpCircle, Check, Flame, Clock, RefreshCw, Star, Wifi, Bell
 } from 'lucide-react';
 import { Question, StageId, Student, LeaderboardRank } from '../../types';
-import { submitStudentAnswer, finishStudentStage, fetchLeaderboard, getStudentStageSubmissions } from '../../services/api';
+import { submitStudentAnswer, finishStudentStage, getStudentStageSubmissions, saveLocalStudentDraft } from '../../services/api';
 
 interface SiswaExamViewProps {
   student: Student;
@@ -58,6 +58,7 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
     currentRank: number;
     totalParticipants: number;
     topLeaderboard: LeaderboardRank[];
+    cloudSynced?: boolean;
   } | null>(null);
 
   // Stage Completion Screen (Requirement 6)
@@ -69,6 +70,9 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
   const [submitting, setSubmitting] = useState(false);
   const [zoomedImage, setZoomedImage] = useState<string | null>(null);
   const [fontSize, setFontSize] = useState<'normal' | 'large' | 'xlarge'>('normal');
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const [showFinishConfirm, setShowFinishConfirm] = useState(false);
+  const [examErrorToast, setExamErrorToast] = useState<string | null>(null);
 
   // Watch for new student additions in real-time
   useEffect(() => {
@@ -81,28 +85,37 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
     prevStudentCountRef.current = students.length;
   }, [students, student.id]);
 
-  // Load submissions and calculate existing score on initial load & stage changes
+  const hasInitializedStageRef = useRef(false);
+  const stagesRef = useRef(stages);
+  stagesRef.current = stages;
+
+  // Load submissions and calculate existing score ONLY on initial mount or actual activeStageId / student.id change
   useEffect(() => {
-    setCurrentIndex(0);
-    setIsStageFinished(false);
+    const stageChanged = prevStageIdRef.current !== activeStageId;
+    if (!hasInitializedStageRef.current || stageChanged) {
+      setCurrentIndex(0);
+      setIsStageFinished(false);
+      setMyFinalRank(null);
+      hasInitializedStageRef.current = true;
+    }
 
     // Detect if stage changed live by Panitia
-    if (prevStageIdRef.current !== activeStageId) {
-      setStageChangeNotification(`Panitia telah mengaktifkan ${stages[activeStageId]?.name || activeStageId}! Lembar soal telah diperbarui.`);
+    if (stageChanged) {
+      setStageChangeNotification(
+        `Panitia telah mengaktifkan ${stagesRef.current[activeStageId]?.name || activeStageId}! Lembar soal telah diperbarui.`
+      );
       prevStageIdRef.current = activeStageId;
     }
 
-    // Restore any existing submissions from Firestore for this student and stage
+    // Restore any existing submissions from Firestore/draft for this student and stage
     getStudentStageSubmissions(student.id, activeStageId)
       .then(res => {
-        if (res.submittedQuestionIds.length > 0) {
-          setAnswers(prev => ({ ...prev, ...res.answers }));
-          setSubmittedQuestionIds(res.submittedQuestionIds);
-          setCurrentScore(res.totalScore);
-        }
+        setAnswers(res.answers || {});
+        setSubmittedQuestionIds(res.submittedQuestionIds || []);
+        setCurrentScore(res.totalScore || 0);
       })
       .catch(() => {});
-  }, [activeStageId, student.id, stages]);
+  }, [activeStageId, student.id]);
 
   // Real-time synchronization when leaderboard prop updates from Firestore
   useEffect(() => {
@@ -110,8 +123,8 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
       setStageLeaderboard(leaderboard);
       const myRank = leaderboard.find(r => r.studentId === student.id);
       if (myRank) {
-        setCurrentScore(myRank.totalScore);
         setMyFinalRank(myRank);
+        setCurrentScore(prev => (myRank.totalScore > prev ? myRank.totalScore : prev));
       }
     }
   }, [leaderboard, student.id]);
@@ -127,12 +140,17 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
     }
   }, [isStageFinished]);
 
-  // Handle Answer Selection
+  // Handle Answer Selection + Auto-save draft locally
   const handleAnswerChange = (questionId: string, val: any) => {
-    setAnswers(prev => ({
-      ...prev,
-      [questionId]: val
-    }));
+    setAnswers(prev => {
+      const next = { ...prev, [questionId]: val };
+      saveLocalStudentDraft(student.id, activeStageId, {
+        answers: next,
+        submittedQuestionIds,
+        totalScore: currentScore
+      });
+      return next;
+    });
   };
 
   // Submit Answer for Current Question
@@ -141,7 +159,8 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
     const currentAnswer = answers[currentQuestion.id];
 
     if (currentAnswer === undefined || currentAnswer === null || (Array.isArray(currentAnswer) && currentAnswer.length === 0)) {
-      alert('Silakan pilih atau isi jawaban terlebih dahulu sebelum mengirim.');
+      setExamErrorToast('Silakan pilih atau isi jawaban terlebih dahulu sebelum mengirim.');
+      setTimeout(() => setExamErrorToast(null), 4000);
       return;
     }
 
@@ -159,7 +178,6 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
       setLastSubmissionResult(res);
       setShowQuestionResultModal(true);
 
-      // Trigger small reward confetti on correct answer!
       if (res.isCorrect) {
         confetti({
           particleCount: 30,
@@ -167,13 +185,9 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
           origin: { y: 0.7 }
         });
       }
-
-      // Check if all questions are completed
-      if (submittedQuestionIds.length + 1 >= stageQuestions.length) {
-        // Can optionally auto-finish or prompt
-      }
     } catch (err: any) {
-      alert('Gagal mengirim jawaban: ' + err.message);
+      setExamErrorToast('Gagal mengirim jawaban: ' + (err.message || 'Periksa koneksi internet.'));
+      setTimeout(() => setExamErrorToast(null), 5000);
     } finally {
       setSubmitting(false);
     }
@@ -181,9 +195,11 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
 
   // Finalize stage submission
   const handleFinishStage = async () => {
-    if (!window.confirm('Apakah kamu yakin ingin menyelesaikan babak ini dan melihat peringkat akhirmu?')) {
-      return;
-    }
+    setShowFinishConfirm(true);
+  };
+
+  const confirmFinishStage = async () => {
+    setShowFinishConfirm(false);
     setSubmitting(true);
     try {
       const res = await finishStudentStage(student.id, activeStageId);
@@ -191,9 +207,9 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
       setMyFinalRank(res.myRank || null);
       setIsStageFinished(true);
       setShowQuestionResultModal(false);
-      onRefreshState();
     } catch (err: any) {
-      alert('Gagal menyelesaikan babak: ' + err.message);
+      setExamErrorToast('Gagal menyelesaikan babak: ' + (err.message || 'Terjadi kesalahan.'));
+      setTimeout(() => setExamErrorToast(null), 5000);
     } finally {
       setSubmitting(false);
     }
@@ -430,7 +446,7 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
             </div>
 
             <button
-              onClick={onLogout}
+              onClick={() => setShowLogoutConfirm(true)}
               className="p-2 text-white/80 hover:text-white hover:bg-white/10 rounded-xl transition"
               title="Keluar"
             >
@@ -476,6 +492,23 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
       {/* QUESTION WORKSPACE */}
       <main className="max-w-4xl mx-auto w-full p-3 sm:p-6 flex-1 space-y-4">
         
+        {/* Error Toast Banner */}
+        {examErrorToast && (
+          <div className="bg-red-50 border-2 border-red-300 text-red-900 p-3.5 rounded-2xl font-bold text-xs sm:text-sm flex items-center justify-between gap-2 shadow-md animate-fadeIn">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-5 h-5 text-red-600 shrink-0" />
+              <span>{examErrorToast}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setExamErrorToast(null)}
+              className="text-xs bg-red-100 hover:bg-red-200 px-2.5 py-1 rounded-lg font-extrabold"
+            >
+              Tutup
+            </button>
+          </div>
+        )}
+
         {/* Realtime Stage Change Notification from Panitia */}
         {stageChangeNotification && (
           <div className="bg-amber-400 text-slate-950 p-3.5 rounded-2xl font-bold text-xs sm:text-sm flex items-center justify-between gap-2 shadow-lg animate-fadeIn border-2 border-amber-300">
@@ -845,6 +878,11 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
               <p className="text-xs text-slate-500 mt-0.5">
                 Total Akumulasi Skormu Saat Ini: <strong className="text-amber-600 font-bold">{lastSubmissionResult.totalScore} Poin</strong>
               </p>
+              {lastSubmissionResult.cloudSynced === false && (
+                <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 mt-2 font-semibold">
+                  Koneksi internet sedang lambat/terbatas — jawaban aman tersimpan di perangkat ini.
+                </p>
+              )}
             </div>
 
             {/* LIVE RANKING BOX (Requirement 6) */}
@@ -924,6 +962,71 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
               <X className="w-5 h-5" />
             </button>
             <img src={zoomedImage} alt="Zoom" className="max-h-[85vh] w-auto object-contain mx-auto" />
+          </div>
+        </div>
+      )}
+
+      {/* LOGOUT CONFIRMATION MODAL (Prevents accidental thumb tap logout on mobile) */}
+      {showLogoutConfirm && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-white rounded-3xl shadow-2xl border border-slate-200 max-w-sm w-full p-6 text-center space-y-4 animate-scaleIn">
+            <div className="w-12 h-12 mx-auto rounded-2xl bg-red-100 text-red-600 flex items-center justify-center">
+              <LogOut className="w-6 h-6" />
+            </div>
+            <h3 className="text-lg font-black text-slate-900">Keluar dari Sesi Ujian?</h3>
+            <p className="text-xs sm:text-sm text-slate-600">
+              Jawaban yang sudah kamu kirim tetap tersimpan aman. Kamu masih bisa masuk kembali dengan Nomor Peserta dan PIN kamu.
+            </p>
+            <div className="flex gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowLogoutConfirm(false)}
+                className="flex-1 py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded-xl text-xs sm:text-sm transition"
+              >
+                Batal, Lanjut Ujian
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowLogoutConfirm(false);
+                  onLogout();
+                }}
+                className="flex-1 py-2.5 px-4 bg-red-600 hover:bg-red-700 text-white font-bold rounded-xl text-xs sm:text-sm transition"
+              >
+                Ya, Keluar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FINISH STAGE CONFIRMATION MODAL */}
+      {showFinishConfirm && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-white rounded-3xl shadow-2xl border border-slate-200 max-w-sm w-full p-6 text-center space-y-4 animate-scaleIn">
+            <div className="w-12 h-12 mx-auto rounded-2xl bg-emerald-100 text-emerald-600 flex items-center justify-center">
+              <CheckCircle2 className="w-6 h-6" />
+            </div>
+            <h3 className="text-lg font-black text-slate-900">Selesaikan Babak Ini?</h3>
+            <p className="text-xs sm:text-sm text-slate-600">
+              Kamu sudah mengirim <strong>{submittedQuestionIds.length} dari {stageQuestions.length}</strong> soal. Yakin ingin melihat rapor & peringkat akhirmu?
+            </p>
+            <div className="flex gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowFinishConfirm(false)}
+                className="flex-1 py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded-xl text-xs sm:text-sm transition"
+              >
+                Periksa Lagi
+              </button>
+              <button
+                type="button"
+                onClick={confirmFinishStage}
+                className="flex-1 py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs sm:text-sm transition"
+              >
+                Ya, Selesaikan
+              </button>
+            </div>
           </div>
         </div>
       )}

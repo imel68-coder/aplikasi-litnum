@@ -86,7 +86,14 @@ export interface StudentProgress {
   studentId: string;
   stageId: StageId;
   completedQuestionIds: string[];
+  correctQuestionIds?: string[];
+  answers?: Record<string, any>;
+  questionScores?: Record<string, number>;
   totalScore: number;
+  totalAnswered?: number;
+  correctCount?: number;
+  lastSubmitTime?: number;
+  lastUpdatedAt?: number;
   isFinished: boolean;
   finishedAt?: number;
 }

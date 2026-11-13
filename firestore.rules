@@ -2,39 +2,93 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helper functions
     function isValidId(id) {
-      return id is string && id.size() > 0 && id.size() <= 128;
+      return id is string && id.size() > 0 && id.size() <= 256 && id.matches('^[a-zA-Z0-9_.\\-]+$');
     }
 
-    // App State collection
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function isValidAppState(data) {
+      return data is map && data.size() <= 40;
+    }
+
+    function isValidStudent(data) {
+      return data is map
+        && data.keys().hasAll(['id', 'noPeserta', 'nama', 'qualifiedStage', 'status'])
+        && data.id is string && data.id.size() > 0 && data.id.size() <= 256
+        && data.noPeserta is string && data.noPeserta.size() > 0 && data.noPeserta.size() <= 64
+        && data.nama is string && data.nama.size() > 0 && data.nama.size() <= 200
+        && data.qualifiedStage in ['penyisihan', 'top30', 'semifinal', 'final']
+        && data.status in ['aktif', 'lolos', 'gugur', 'selesai'];
+    }
+
+    function isValidQuestion(data) {
+      return data is map
+        && data.keys().hasAll(['id', 'stageId', 'order', 'type', 'category', 'questionPrompt', 'points'])
+        && data.id is string && data.id.size() > 0 && data.id.size() <= 256
+        && data.stageId in ['penyisihan', 'top30', 'semifinal', 'final']
+        && data.order is number
+        && data.type in ['pg_single', 'pg_complex', 'true_false', 'matching']
+        && data.category in ['literasi', 'numerasi']
+        && data.questionPrompt is string && data.questionPrompt.size() <= 50000
+        && data.points is number && data.points >= 0 && data.points <= 100000;
+    }
+
+    function isValidSubmission(data) {
+      return data is map
+        && data.keys().hasAll(['id', 'studentId', 'stageId', 'questionId', 'scoreEarned', 'submittedAt'])
+        && data.id is string && data.id.size() > 0 && data.id.size() <= 256
+        && data.studentId is string && data.studentId.size() > 0 && data.studentId.size() <= 256
+        && data.stageId in ['penyisihan', 'top30', 'semifinal', 'final']
+        && data.questionId is string && data.questionId.size() > 0 && data.questionId.size() <= 256
+        && data.scoreEarned is number && data.scoreEarned >= 0 && data.scoreEarned <= 100000
+        && data.submittedAt is number;
+    }
+
+    function isValidStudentProgress(data) {
+      return data is map
+        && data.keys().hasAll(['studentId', 'stageId', 'totalScore', 'isFinished'])
+        && data.studentId is string && data.studentId.size() > 0 && data.studentId.size() <= 256
+        && data.stageId in ['penyisihan', 'top30', 'semifinal', 'final']
+        && data.totalScore is number && data.totalScore >= 0
+        && data.isFinished is bool;
+    }
+
+    // App State, bundled caches & live leaderboard summaries
     match /app_state/{docId} {
       allow read: if true;
-      allow write: if true;
+      allow create, update: if isValidId(docId) && isValidAppState(incoming());
+      allow delete: if false;
     }
 
     // Students collection
     match /students/{studentId} {
       allow read: if true;
-      allow write: if isValidId(studentId);
+      allow create, update: if isValidId(studentId) && isValidStudent(incoming());
+      allow delete: if isValidId(studentId);
     }
 
     // Questions collection
     match /questions/{questionId} {
       allow read: if true;
-      allow write: if isValidId(questionId);
+      allow create, update: if isValidId(questionId) && isValidQuestion(incoming());
+      allow delete: if isValidId(questionId);
     }
 
     // Submissions collection
     match /submissions/{submissionId} {
       allow read: if true;
-      allow write: if isValidId(submissionId);
+      allow create, update: if isValidId(submissionId) && isValidSubmission(incoming());
+      allow delete: if isValidId(submissionId);
     }
 
     // Student Progress collection
     match /student_progress/{progressId} {
       allow read: if true;
-      allow write: if isValidId(progressId);
+      allow create, update: if isValidId(progressId) && isValidStudentProgress(incoming());
+      allow delete: if isValidId(progressId);
     }
 
     // Default deny for any other path

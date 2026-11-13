@@ -20,6 +20,14 @@
         "updatedAt": {
           "type": "number",
           "description": "Timestamp when state was last updated"
+        },
+        "studentsVersion": {
+          "type": "number",
+          "description": "Version timestamp for bundled student cache invalidation"
+        },
+        "questionsVersion": {
+          "type": "number",
+          "description": "Version timestamp for bundled question cache invalidation"
         }
       },
       "required": ["activeStageId"]

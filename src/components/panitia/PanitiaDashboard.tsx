@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { 
   Users, BookOpen, Trophy, Play, CheckCircle, RefreshCw, Plus, 
   Trash2, Edit, Award, ExternalLink, ShieldCheck, LogOut, Download, 
@@ -10,7 +10,8 @@ import { Question, StageId, Student, LeaderboardRank } from '../../types';
 import { 
   adminActivateStage, adminPromoteStudents, adminDeleteQuestion, 
   adminDeleteStudent, adminBulkSeedStudents, adminResetProgress,
-  adminSaveQuestion, adminSaveStudent,
+  adminSaveQuestion, adminSaveStudent, adminImportStudentsFromCSV,
+  adminOptimizeCloudCache,
   exportDatabaseBackup, importDatabaseBackup, getCustomServerUrl,
   setCustomServerUrl, getServerStatus, sendRealtimePing
 } from '../../services/api';
@@ -58,6 +59,8 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
     confirmText?: string;
     onConfirm: () => void;
   } | null>(null);
+  const [isImportingCsv, setIsImportingCsv] = useState(false);
+  const studentCsvInputRef = useRef<HTMLInputElement>(null);
 
   const showToast = (msg: string) => {
     setSuccessToast(msg);
@@ -300,6 +303,56 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const downloadStudentCSVTemplate = () => {
+    const templateContent = [
+      'No Peserta,Nama Siswa,Asal Sekolah,Kelas,PIN',
+      'G26-001,Ahmad Fauzi,SMPN 26 Sijunjung,VIII A,1234',
+      'G26-002,Bunga Lestari,SMPN 1 Sijunjung,VIII B,1234',
+      'G26-003,Citra Dewi,MTsN 1 Sijunjung,VIII C,1234'
+    ].join('\n');
+    const blob = new Blob([templateContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'Format_Template_164_Siswa_GELORA26.csv';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    showToast('Template CSV berhasil diunduh!');
+  };
+
+  const handleImportStudentsCSVFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsImportingCsv(true);
+    try {
+      const text = await file.text();
+      const res = await adminImportStudentsFromCSV(text);
+      showToast(`🎉 Berhasil mengimpor ${res.addedCount} siswa ke Cloud Database! Total sekarang: ${res.total} siswa.`);
+      onRefreshState();
+    } catch (err: any) {
+      showToast('Gagal mengimpor file CSV: ' + err.message);
+    } finally {
+      setIsImportingCsv(false);
+      if (studentCsvInputRef.current) {
+        studentCsvInputRef.current.value = '';
+      }
+    }
+  };
+
+  const handleSyncCloudCache = async () => {
+    setActionLoading(true);
+    try {
+      const res = await adminOptimizeCloudCache();
+      showToast(`⚡ Cache Cepat aktif untuk ${res.studentsCount} siswa & ${res.questionsCount} soal!`);
+    } catch (err: any) {
+      showToast('Gagal sinkronisasi cache: ' + (err.message || 'Cek koneksi'));
+    } finally {
+      setActionLoading(false);
+    }
   };
 
   return (
@@ -808,6 +861,35 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
 
               {/* Action Buttons */}
               <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="file"
+                  ref={studentCsvInputRef}
+                  onChange={handleImportStudentsCSVFile}
+                  accept=".csv,.txt"
+                  className="hidden"
+                />
+
+                <button
+                  type="button"
+                  onClick={downloadStudentCSVTemplate}
+                  className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold flex items-center gap-1.5 transition"
+                  title="Unduh format template CSV untuk 164 siswa"
+                >
+                  <FileText className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Template CSV</span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={isImportingCsv}
+                  onClick={() => studentCsvInputRef.current?.click()}
+                  className="px-3.5 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold flex items-center gap-1.5 transition disabled:opacity-50"
+                  title="Impor ratusan data siswa sekaligus dari file CSV / Excel"
+                >
+                  <UploadCloud className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>{isImportingCsv ? 'Mengimpor...' : 'Impor CSV (Massal)'}</span>
+                </button>
+
                 <button
                   type="button"
                   onClick={exportStudentsToCSV}
@@ -824,7 +906,18 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
                   title="Generate 20 siswa dummy untuk tes akbar"
                 >
                   <Sparkles className="w-3.5 h-3.5 text-amber-600" />
-                  <span>+20 Peserta Demo Cepat</span>
+                  <span>+20 Peserta Demo</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleSyncCloudCache}
+                  disabled={actionLoading}
+                  className="px-3.5 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 rounded-xl text-xs font-bold flex items-center gap-1.5 transition disabled:opacity-50"
+                  title="Perbarui paket cache 1-kali baca untuk 160+ HP siswa agar hemat kuota Firebase"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 text-indigo-600 ${actionLoading ? 'animate-spin' : ''}`} />
+                  <span>Sinkron Cache Cepat</span>
                 </button>
 
                 <button
