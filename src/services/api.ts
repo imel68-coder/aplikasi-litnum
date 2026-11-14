@@ -17,9 +17,21 @@ import {
   classifyFirestoreError,
   CloudErrorKind,
   firebaseConfig,
+  FIRESTORE_DATABASE_ID,
   OperationType,
   testFirestoreConnection
 } from './firebase';
+import {
+  buildTabularSheetsPayload,
+  getActiveGoogleSheetsBridgeUrl,
+  loadLinkedSpreadsheetConfig,
+  matchesParticipantNumber,
+  parseLeaderboardRowsFromSheet,
+  parseProgressRowsFromSheet,
+  parseRowsIntoAppData,
+  sheetsBridgeGet,
+  sheetsBridgePost
+} from './googleSheetsDb';
 import { initialQuestions, initialStages, initialStudents } from '../seedData';
 import {
   AnswerSubmission,
@@ -54,12 +66,14 @@ let lastCloudErrorMessage = '';
 let cachedStudentsVersion = 0;
 let cachedQuestionsVersion = 0;
 let cachedAppStateUpdatedAt = 0;
+let cachedLastSubmissionAt = 0;
+let lastCloudSheetsConfigSyncAt = 0;
 let cachedProgressMap: Record<string, StudentProgress> = {};
 let cachedLeaderboard: LeaderboardRank[] = [];
 let hasBootCheckedServer = false;
 
 export function getFirestoreUpgradeUrl(): string {
-  return `https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/data?openUpgradeDialog=true`;
+  return `https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${FIRESTORE_DATABASE_ID}/data?openUpgradeDialog=true`;
 }
 
 export function getCloudErrorState(): {
@@ -206,7 +220,18 @@ export function computeLeaderboard(
       }
     });
 
-  const progStats: Record<string, { totalScore: number; totalAnswered: number; correctCount: number; lastSubmitTime: number }> = {};
+  const progStats: Record<
+    string,
+    {
+      totalScore: number;
+      totalAnswered: number;
+      correctCount: number;
+      lastSubmitTime: number;
+      hasLoggedIn: boolean;
+      isFinished: boolean;
+      lastUpdatedAt: number;
+    }
+  > = {};
   progressList
     .filter(p => p.stageId === stageId)
     .forEach(p => {
@@ -214,7 +239,10 @@ export function computeLeaderboard(
         totalScore: p.totalScore || 0,
         totalAnswered: p.totalAnswered ?? (p.completedQuestionIds?.length || 0),
         correctCount: p.correctCount ?? (p.correctQuestionIds?.length || 0),
-        lastSubmitTime: p.lastSubmitTime || p.lastUpdatedAt || p.finishedAt || 0
+        lastSubmitTime: p.lastSubmitTime || p.lastUpdatedAt || p.finishedAt || 0,
+        hasLoggedIn: true,
+        isFinished: Boolean(p.isFinished),
+        lastUpdatedAt: p.lastUpdatedAt || p.lastSubmitTime || p.finishedAt || 0
       };
     });
 
@@ -236,10 +264,19 @@ export function computeLeaderboard(
           stats = sStat;
         }
       } else if (pStat) {
-        stats = pStat;
+        stats = {
+          totalScore: pStat.totalScore,
+          totalAnswered: pStat.totalAnswered,
+          correctCount: pStat.correctCount,
+          lastSubmitTime: pStat.lastSubmitTime
+        };
       } else if (sStat) {
         stats = sStat;
       }
+
+      const hasLoggedIn = Boolean(pStat || sStat || stats.totalAnswered > 0);
+      const isFinished = Boolean(pStat?.isFinished);
+      const lastUpdatedAt = Math.max(pStat?.lastUpdatedAt || 0, stats.lastSubmitTime || 0);
 
       return {
         rank: 1,
@@ -250,12 +287,18 @@ export function computeLeaderboard(
         totalScore: Math.round(stats.totalScore * 10) / 10,
         totalAnswered: stats.totalAnswered,
         correctCount: stats.correctCount,
-        lastSubmitTime: stats.lastSubmitTime
+        lastSubmitTime: stats.lastSubmitTime,
+        hasLoggedIn,
+        isFinished,
+        lastUpdatedAt
       };
     })
     .sort((a, b) => {
       if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
       if (b.correctCount !== a.correctCount) return b.correctCount - a.correctCount;
+      const aLogged = a.hasLoggedIn ? 1 : 0;
+      const bLogged = b.hasLoggedIn ? 1 : 0;
+      if (bLogged !== aLogged) return bLogged - aLogged;
       if (a.lastSubmitTime && b.lastSubmitTime) return a.lastSubmitTime - b.lastSubmitTime;
       return a.noPeserta.localeCompare(b.noPeserta);
     });
@@ -456,7 +499,145 @@ async function loadQuestionsSmart(
 }
 
 // ====================================================
-// CORE APP STATE (uses dbLite REST SDK — immune to Listen quota!)
+// GOOGLE SHEETS PRIMARY DB HELPER
+// ====================================================
+
+function hasExplicitSheetQueryOrEnv(): string | null {
+  if (typeof window !== 'undefined') {
+    try {
+      const sheetParam = (new URLSearchParams(window.location.search).get('sheet') || '').trim();
+      if (sheetParam.startsWith('https://script.google.com/')) return sheetParam;
+    } catch {
+      // ignore
+    }
+  }
+  const envUrl = String((import.meta as any)?.env?.VITE_GOOGLE_SHEETS_WEBAPP_URL || '').trim();
+  if (envUrl.startsWith('https://script.google.com/')) return envUrl;
+  return null;
+}
+
+async function resolveActiveSheetsBridgeUrl(forceRefreshCloud = false): Promise<string | null> {
+  const explicitUrl = hasExplicitSheetQueryOrEnv();
+  if (explicitUrl) {
+    // Ensure local cache stays aligned with explicit query param
+    return getActiveGoogleSheetsBridgeUrl() || explicitUrl;
+  }
+
+  const now = Date.now();
+  if (forceRefreshCloud || now - lastCloudSheetsConfigSyncAt > 25000) {
+    lastCloudSheetsConfigSyncAt = now;
+    try {
+      const cfg = await loadLinkedSpreadsheetConfig();
+      if (cfg) {
+        if (
+          cfg.useSheetsAsPrimaryDb &&
+          cfg.bridgeWebAppUrl &&
+          cfg.bridgeWebAppUrl.startsWith('https://script.google.com/')
+        ) {
+          return cfg.bridgeWebAppUrl;
+        }
+        if (cfg.useSheetsAsPrimaryDb === false) {
+          return null;
+        }
+      }
+    } catch {
+      // fallback to local cached config below
+    }
+  }
+
+  return getActiveGoogleSheetsBridgeUrl();
+}
+
+async function fetchStateFromGoogleSheetsBridge(
+  bridgeUrl: string,
+  userRole?: 'admin' | 'student' | null
+) {
+  const res = await sheetsBridgeGet(bridgeUrl, {
+    action: 'state',
+    role: userRole || 'student'
+  });
+
+  const rowsByTab = new Map<string, any[][]>();
+  Object.keys(res.tabs || {}).forEach(tabName => {
+    if (Array.isArray(res.tabs[tabName])) {
+      rowsByTab.set(tabName, res.tabs[tabName]);
+    }
+  });
+
+  const parsed = parseRowsIntoAppData(rowsByTab, cachedDb.questions, cachedDb.stages);
+  const activeStageId = parsed.activeStageId || cachedDb.activeStageId || 'penyisihan';
+  const stages = parsed.stages || cachedDb.stages;
+  const students = parsed.students.length ? parsed.students : cachedDb.students;
+  const questions = parsed.questions.length ? parsed.questions : cachedDb.questions;
+  const announcement = parsed.announcement || cachedDb.announcement;
+
+  if (parsed.studentsVersion) cachedStudentsVersion = parsed.studentsVersion;
+  if (parsed.questionsVersion) cachedQuestionsVersion = parsed.questionsVersion;
+  if (parsed.updatedAt) cachedAppStateUpdatedAt = parsed.updatedAt;
+  if (parsed.lastSubmissionAt) {
+    cachedLastSubmissionAt = Math.max(cachedLastSubmissionAt, parsed.lastSubmissionAt);
+  }
+
+  let progressList: StudentProgress[] = Object.values(cachedProgressMap);
+  if (userRole === 'admin' && Array.isArray(res.tabs?.Progres_Siswa)) {
+    progressList = parseProgressRowsFromSheet(res.tabs.Progres_Siswa);
+    cachedProgressMap = {};
+    progressList.forEach(p => {
+      cachedProgressMap[`${p.studentId}_${p.stageId}`] = p;
+    });
+  }
+
+  let activeLeaderboard: LeaderboardRank[] = [];
+  if (userRole === 'admin') {
+    activeLeaderboard = computeLeaderboard(students, [], activeStageId, progressList);
+  } else if (Array.isArray(res.tabs?.Peringkat_Live)) {
+    activeLeaderboard = parseLeaderboardRowsFromSheet(res.tabs.Peringkat_Live);
+  }
+  if (activeLeaderboard.length === 0) {
+    activeLeaderboard = computeLeaderboard(students, [], activeStageId, progressList);
+  }
+  cachedLeaderboard = activeLeaderboard;
+
+  cachedDb = {
+    stages,
+    students,
+    questions,
+    submissions: [],
+    studentProgress: cachedProgressMap,
+    adminPassword: 'admin',
+    activeStageId,
+    announcement
+  };
+
+  saveLocalCache({
+    activeStageId,
+    stages,
+    students,
+    questions,
+    announcement,
+    studentsVersion: cachedStudentsVersion,
+    questionsVersion: cachedQuestionsVersion,
+    leaderboard: activeLeaderboard.slice(0, 50),
+    savedAt: Date.now()
+  });
+
+  clearCloudError();
+
+  return {
+    activeStageId,
+    stages,
+    students,
+    questions,
+    submissions: [] as AnswerSubmission[],
+    announcement,
+    leaderboard: activeLeaderboard,
+    cloudError: null as CloudErrorKind,
+    cloudErrorMessage: ''
+  };
+}
+
+// ====================================================
+// CORE APP STATE (Routes to Google Sheets if Primary Mode ON, else dbLite REST)
 // ====================================================
 
 export async function fetchAppState(userRole?: 'admin' | 'student' | null): Promise<{
@@ -470,15 +651,24 @@ export async function fetchAppState(userRole?: 'admin' | 'student' | null): Prom
   cloudError: CloudErrorKind;
   cloudErrorMessage: string;
 }> {
+  const bridgeUrl = await resolveActiveSheetsBridgeUrl();
+  if (bridgeUrl) {
+    try {
+      return await fetchStateFromGoogleSheetsBridge(bridgeUrl, userRole);
+    } catch (err) {
+      console.warn('Google Sheets state fetch failed, falling back to cache/Firestore:', err);
+    }
+  }
+
   let activeStageId: StageId = cachedDb.activeStageId || 'penyisihan';
   let stages = cachedDb.stages || initialStages;
   let announcement = cachedDb.announcement || 'Selamat datang di GELORA 26 SMPN 26 Sijunjung!';
   let remoteStudentsVersion = cachedStudentsVersion;
   let remoteQuestionsVersion = cachedQuestionsVersion;
 
-  if (!hasBootCheckedServer) {
+  if (!hasBootCheckedServer && !bridgeUrl && !getActiveGoogleSheetsBridgeUrl()) {
     hasBootCheckedServer = true;
-    // Non-blocking boot connection check
+    // Non-blocking boot connection check (only needed when using Firestore mode)
     testFirestoreConnection().catch(() => {});
   }
 
@@ -646,11 +836,45 @@ export async function loginUser(
     const inputNo = rawInputNo.toUpperCase();
     const inputPin = (payload.pin || '').trim();
 
-    let student = cachedDb.students.find(
-      s => s.noPeserta.trim().toUpperCase() === inputNo
-    );
-
+    let student = cachedDb.students.find(s => matchesParticipantNumber(s.noPeserta, inputNo));
+    let loadedFullStudentList = cachedDb.students.length > initialStudents.length;
+    let bridgeLookupError: string | null = null;
     let firestoreLookupError: CloudErrorKind = null;
+
+    if (!student) {
+      const bridgeUrl = await resolveActiveSheetsBridgeUrl();
+      if (bridgeUrl) {
+        // 1. Try ultra-fast live Sheets findStudent endpoint (Code.gs v3+)
+        try {
+          const fastRes = await sheetsBridgeGet(bridgeUrl, {
+            action: 'findStudent',
+            noPeserta: inputNo
+          }, 0);
+          if (fastRes?.found && fastRes.student) {
+            const foundSt = fastRes.student as Student;
+            const existIdx = cachedDb.students.findIndex(s => s.id === foundSt.id || matchesParticipantNumber(s.noPeserta, foundSt.noPeserta));
+            if (existIdx >= 0) cachedDb.students[existIdx] = foundSt;
+            else cachedDb.students.push(foundSt);
+            student = foundSt;
+          }
+        } catch {
+          // Older Code.gs v2 or transient error — fall through to full state fetch
+        }
+
+        // 2. Fallback to full Google Sheets state (always refreshes cachedDb.students & questions)
+        if (!student) {
+          try {
+            const refreshed = await fetchStateFromGoogleSheetsBridge(bridgeUrl, 'student');
+            if (refreshed.students.length > 0) {
+              loadedFullStudentList = true;
+              student = refreshed.students.find(s => matchesParticipantNumber(s.noPeserta, inputNo));
+            }
+          } catch (err: any) {
+            bridgeLookupError = err?.message || 'Gagal membaca data dari Google Sheets.';
+          }
+        }
+      }
+    }
 
     if (!student) {
       try {
@@ -659,7 +883,8 @@ export async function loginUser(
           const bundleStudents = bundleSnap.data().items as Student[];
           if (bundleStudents.length > 0) {
             cachedDb.students = bundleStudents;
-            student = bundleStudents.find(s => s.noPeserta.trim().toUpperCase() === inputNo);
+            loadedFullStudentList = true;
+            student = bundleStudents.find(s => matchesParticipantNumber(s.noPeserta, inputNo));
           }
         }
       } catch (err) {
@@ -667,7 +892,7 @@ export async function loginUser(
       }
     }
 
-    if (!student) {
+    if (!student && !loadedFullStudentList) {
       try {
         const qUpper = query(collection(dbLite, 'students'), where('noPeserta', '==', inputNo));
         const snapUpper = await getDocs(qUpper);
@@ -683,32 +908,50 @@ export async function loginUser(
           });
         }
       } catch (err) {
-        firestoreLookupError = recordCloudError(err, OperationType.LIST, 'students');
+        if (!firestoreLookupError) {
+          firestoreLookupError = recordCloudError(err, OperationType.LIST, 'students');
+        }
       }
     }
 
     if (!student) {
-      if (firestoreLookupError === 'quota_exceeded') {
-        throw new Error(
-          'Kuota harian server Firebase sedang penuh untuk sementara. Data Anda TIDAK hilang — tunggu beberapa saat atau hubungi Panitia.'
-        );
+      if (!loadedFullStudentList) {
+        if (bridgeLookupError) {
+          throw new Error(
+            `Gagal terhubung ke database Google Sheets (${bridgeLookupError}). Periksa koneksi internet Anda lalu tekan Muat Ulang.`
+          );
+        }
+        if (firestoreLookupError === 'quota_exceeded') {
+          throw new Error(
+            'Kuota harian server Firebase sedang penuh untuk sementara. Gunakan Link Ujian Google Sheets dari Panitia atau tunggu beberapa saat.'
+          );
+        }
+        if (firestoreLookupError === 'permission_denied') {
+          throw new Error(
+            'Akses ke server database ditolak. Mohon hubungi Panitia untuk sinkronisasi aturan database.'
+          );
+        }
+        if (firestoreLookupError === 'offline') {
+          throw new Error(
+            'Koneksi internet terputus saat mencari Nomor Peserta. Periksa jaringan HP kamu dan coba lagi.'
+          );
+        }
       }
-      if (firestoreLookupError === 'permission_denied') {
-        throw new Error(
-          'Akses ke server database ditolak. Mohon hubungi Panitia untuk sinkronisasi aturan database.'
-        );
-      }
-      if (firestoreLookupError === 'offline') {
-        throw new Error(
-          'Koneksi internet terputus saat mencari Nomor Peserta. Periksa jaringan HP kamu dan coba lagi.'
-        );
-      }
-      throw new Error(`Nomor Peserta "${payload.noPeserta}" tidak ditemukan.`);
+      throw new Error(
+        `Nomor Peserta "${payload.noPeserta}" tidak ditemukan.${
+          !loadedFullStudentList
+            ? ` (Baru ${cachedDb.students.length} data bawaan termuat — tekan tombol Segarkan Data Siswa di atas.)`
+            : ''
+        }`
+      );
     }
 
-    if (inputPin && student.pin && inputPin !== student.pin && inputPin !== '1234') {
+    if (inputPin && student.pin && inputPin !== String(student.pin).trim() && inputPin !== '1234') {
       throw new Error('PIN Peserta tidak cocok. (Default: 1234)');
     }
+
+    // Record student login silently to Google Sheets / Firestore so Panitia sees "Sudah Login" live
+    recordStudentLogin(student, cachedDb.activeStageId).catch(() => {});
 
     return {
       success: true,
@@ -718,6 +961,86 @@ export async function loginUser(
   }
 
   throw new Error('Role tidak valid');
+}
+
+export async function recordStudentLogin(
+  student: Student,
+  stageId: StageId = cachedDb.activeStageId
+): Promise<void> {
+  const now = Date.now();
+  const progressId = `${student.id}_${stageId}`;
+  const existing = cachedProgressMap[progressId];
+
+  if (!existing) {
+    cachedProgressMap[progressId] = {
+      studentId: student.id,
+      stageId,
+      completedQuestionIds: [],
+      correctQuestionIds: [],
+      answers: {},
+      questionScores: {},
+      totalScore: 0,
+      totalAnswered: 0,
+      correctCount: 0,
+      lastSubmitTime: 0,
+      lastUpdatedAt: now,
+      isFinished: false
+    };
+  } else {
+    cachedProgressMap[progressId] = {
+      ...existing,
+      lastUpdatedAt: Math.max(existing.lastUpdatedAt || 0, now)
+    };
+  }
+
+  const bridgeUrl = await resolveActiveSheetsBridgeUrl();
+  if (bridgeUrl) {
+    try {
+      await sheetsBridgePost(
+        bridgeUrl,
+        {
+          action: 'recordLogin',
+          studentId: student.id,
+          stageId,
+          student: {
+            id: student.id,
+            noPeserta: student.noPeserta,
+            nama: student.nama,
+            sekolah: student.sekolah
+          }
+        },
+        0
+      );
+    } catch {
+      // Non-blocking: older Apps Script without recordLogin still lets student log in cleanly
+    }
+    return;
+  }
+
+  try {
+    const batch = writeBatch(dbLite);
+    batch.set(
+      doc(dbLite, 'student_progress', progressId),
+      {
+        studentId: student.id,
+        stageId,
+        lastUpdatedAt: now
+      },
+      { merge: true }
+    );
+    batch.set(
+      doc(dbLite, 'app_state', 'submission_signal'),
+      {
+        lastSubmissionAt: now,
+        lastStageId: stageId,
+        lastStudentId: student.id
+      },
+      { merge: true }
+    );
+    await batch.commit();
+  } catch {
+    // Non-blocking fallback
+  }
 }
 
 // ====================================================
@@ -770,6 +1093,50 @@ export async function getStudentStageSubmissions(studentId: string, stageId: Sta
   };
 
   const progressId = `${studentId}_${stageId}`;
+  const bridgeUrl = await resolveActiveSheetsBridgeUrl();
+
+  if (bridgeUrl) {
+    try {
+      const sheetProg = await sheetsBridgeGet(bridgeUrl, {
+        action: 'studentProgress',
+        studentId,
+        stageId
+      });
+      if (sheetProg?.found && Array.isArray(sheetProg.row)) {
+        const parsedList = parseProgressRowsFromSheet([[], sheetProg.row]);
+        const p = parsedList[0];
+        if (p) {
+          cachedProgressMap[progressId] = p;
+          const syncedResult = {
+            answers: { ...(p.answers || {}) },
+            submittedQuestionIds: Array.isArray(p.completedQuestionIds) ? [...p.completedQuestionIds] : [],
+            questionScores: { ...(p.questionScores || {}) },
+            totalScore: typeof p.totalScore === 'number' ? p.totalScore : 0
+          };
+          saveLocalStudentDraft(studentId, stageId, syncedResult);
+          return syncedResult;
+        }
+      }
+      if (sheetProg?.ok && sheetProg.found === false) {
+        delete cachedProgressMap[progressId];
+        try {
+          localStorage.removeItem(getDraftKey(studentId, stageId));
+        } catch {
+          // ignore
+        }
+        return {
+          answers: {},
+          submittedQuestionIds: [],
+          questionScores: {},
+          totalScore: 0
+        };
+      }
+      return result;
+    } catch {
+      return result;
+    }
+  }
+
   try {
     const progSnap = await getDoc(doc(dbLite, 'student_progress', progressId));
     if (progSnap.exists()) {
@@ -943,8 +1310,9 @@ export async function submitStudentAnswer(payload: {
   const progressId = `${payload.studentId}_${payload.stageId}`;
   let existingProg = cachedProgressMap[progressId];
   const localDraft = loadLocalStudentDraft(payload.studentId, payload.stageId);
+  const bridgeUrl = await resolveActiveSheetsBridgeUrl();
 
-  if (!existingProg) {
+  if (!existingProg && !bridgeUrl) {
     try {
       const snap = await getDoc(doc(dbLite, 'student_progress', progressId));
       if (snap.exists()) {
@@ -1028,35 +1396,71 @@ export async function submitStudentAnswer(payload: {
   });
 
   let cloudSynced = false;
-  try {
-    const batch = writeBatch(dbLite);
-    batch.set(doc(dbLite, 'submissions', submissionId), submission);
-    batch.set(doc(dbLite, 'student_progress', progressId), updatedProgress, { merge: true });
-    // Notify Panitia laptop signal doc (NOT app_state/main so 160 student phones don't wake up)
-    batch.set(
-      doc(dbLite, 'app_state', 'submission_signal'),
-      {
-        lastSubmissionAt: now,
-        lastStageId: payload.stageId,
-        lastStudentId: payload.studentId
-      },
-      { merge: true }
-    );
-    await batch.commit();
-    cloudSynced = true;
-    clearCloudError();
-  } catch (err) {
-    recordCloudError(err, OperationType.WRITE, `submissions/${submissionId}`);
+
+  if (bridgeUrl) {
+    try {
+      const gsRes = await sheetsBridgePost(bridgeUrl, {
+        action: 'submitAnswer',
+        submission,
+        progress: updatedProgress,
+        student: {
+          id: student.id,
+          noPeserta: student.noPeserta,
+          nama: student.nama,
+          sekolah: student.sekolah
+        }
+      });
+      cloudSynced = true;
+      clearCloudError();
+      const topLb = Array.isArray(gsRes.topLeaderboard) && gsRes.topLeaderboard.length
+        ? (gsRes.topLeaderboard as LeaderboardRank[])
+        : cachedLeaderboard.slice(0, 5);
+      return {
+        success: true,
+        isCorrect,
+        scoreEarned,
+        totalScore,
+        currentRank: Number(gsRes.currentRank) || 1,
+        totalParticipants: Number(gsRes.totalParticipants) || cachedDb.students.length,
+        topLeaderboard: topLb,
+        cloudSynced
+      };
+    } catch (err) {
+      console.warn('Google Sheets submitAnswer failed, saving locally:', err);
+    }
+  } else {
+    try {
+      const batch = writeBatch(dbLite);
+      batch.set(doc(dbLite, 'submissions', submissionId), submission);
+      batch.set(doc(dbLite, 'student_progress', progressId), updatedProgress, { merge: true });
+      // Notify Panitia laptop signal doc (NOT app_state/main so 160 student phones don't wake up)
+      batch.set(
+        doc(dbLite, 'app_state', 'submission_signal'),
+        {
+          lastSubmissionAt: now,
+          lastStageId: payload.stageId,
+          lastStudentId: payload.studentId
+        },
+        { merge: true }
+      );
+      await batch.commit();
+      cloudSynced = true;
+      clearCloudError();
+    } catch (err) {
+      recordCloudError(err, OperationType.WRITE, `submissions/${submissionId}`);
+    }
   }
 
   let currentLeaderboard = cachedLeaderboard;
-  try {
-    const lbSnap = await getDoc(doc(dbLite, 'app_state', `leaderboard_${payload.stageId}`));
-    if (lbSnap.exists() && Array.isArray(lbSnap.data().rankings)) {
-      currentLeaderboard = lbSnap.data().rankings as LeaderboardRank[];
+  if (!bridgeUrl) {
+    try {
+      const lbSnap = await getDoc(doc(dbLite, 'app_state', `leaderboard_${payload.stageId}`));
+      if (lbSnap.exists() && Array.isArray(lbSnap.data().rankings)) {
+        currentLeaderboard = lbSnap.data().rankings as LeaderboardRank[];
+      }
+    } catch {
+      // use cachedLeaderboard
     }
-  } catch {
-    // use cachedLeaderboard
   }
 
   const updatedList = currentLeaderboard.length
@@ -1121,6 +1525,31 @@ export async function finishStudentStage(studentId: string, stageId: StageId): P
   const draft = loadLocalStudentDraft(studentId, stageId);
   const totalScore = existing?.totalScore ?? draft?.totalScore ?? 0;
   const now = Date.now();
+  const bridgeUrl = await resolveActiveSheetsBridgeUrl();
+
+  if (bridgeUrl) {
+    const student = cachedDb.students.find(s => s.id === studentId);
+    try {
+      const gsRes = await sheetsBridgePost(bridgeUrl, {
+        action: 'finishStage',
+        studentId,
+        stageId,
+        totalScore,
+        student: student
+          ? { id: student.id, noPeserta: student.noPeserta, nama: student.nama, sekolah: student.sekolah }
+          : { id: studentId }
+      });
+      const lb = Array.isArray(gsRes.leaderboard) ? (gsRes.leaderboard as LeaderboardRank[]) : cachedLeaderboard;
+      if (lb.length) cachedLeaderboard = lb;
+      return {
+        success: true,
+        myRank: gsRes.myRank || lb.find(r => r.studentId === studentId),
+        leaderboard: lb
+      };
+    } catch (err) {
+      console.warn('Google Sheets finishStage failed:', err);
+    }
+  }
 
   try {
     const batch = writeBatch(dbLite);
@@ -1181,6 +1610,28 @@ export async function fetchLeaderboard(stageId: StageId): Promise<LeaderboardRan
 // PANITIA (ADMIN) OPERATIONS WITH FIRESTORE REALTIME SYNC
 // ====================================================
 
+// Helper to mirror student/question/stage edits to Google Sheets Web App when Primary Mode is active
+async function pushSheetsAdminTab(action: 'saveStudents' | 'saveQuestions' | 'activateStage', extra?: Record<string, any>) {
+  const bridgeUrl = await resolveActiveSheetsBridgeUrl();
+  if (!bridgeUrl) return;
+  const tabular = buildTabularSheetsPayload({
+    activeStageId: cachedDb.activeStageId,
+    stages: cachedDb.stages,
+    students: cachedDb.students,
+    questions: cachedDb.questions,
+    progressList: Object.values(cachedProgressMap),
+    leaderboard: cachedLeaderboard,
+    announcement: cachedDb.announcement
+  });
+  await sheetsBridgePost(bridgeUrl, {
+    action,
+    ...(action === 'saveStudents' ? { studentRows: tabular.studentRows } : {}),
+    ...(action === 'saveQuestions' ? { questionRows: tabular.questionRows } : {}),
+    ...(action === 'activateStage' ? { stageRows: tabular.stageRows } : {}),
+    ...(extra || {})
+  });
+}
+
 export async function adminActivateStage(stageId: StageId) {
   const newStages = { ...cachedDb.stages };
   Object.keys(newStages).forEach(k => {
@@ -1193,6 +1644,12 @@ export async function adminActivateStage(stageId: StageId) {
   cachedDb.activeStageId = stageId;
   cachedDb.stages = newStages;
   const now = Date.now();
+  const bridgeUrl = await resolveActiveSheetsBridgeUrl();
+
+  if (bridgeUrl) {
+    await pushSheetsAdminTab('activateStage', { stageId });
+    cachedAppStateUpdatedAt = now;
+  }
 
   try {
     await setDoc(
@@ -1207,8 +1664,10 @@ export async function adminActivateStage(stageId: StageId) {
     cachedAppStateUpdatedAt = now;
     clearCloudError();
   } catch (err) {
-    recordCloudError(err, OperationType.WRITE, 'app_state/main');
-    throw new Error(lastCloudErrorMessage || 'Gagal mengaktifkan babak di server.');
+    if (!bridgeUrl) {
+      recordCloudError(err, OperationType.WRITE, 'app_state/main');
+      throw new Error(lastCloudErrorMessage || 'Gagal mengaktifkan babak di server.');
+    }
   }
 
   return { success: true, activeStageId: stageId, stages: newStages };
@@ -1234,6 +1693,11 @@ export async function adminPromoteStudents(fromStageId: StageId, toStageId: Stag
     }
   });
 
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    await pushSheetsAdminTab('saveStudents');
+  }
+
   try {
     const CHUNK_SIZE = 400;
     for (let i = 0; i < cachedDb.students.length; i += CHUNK_SIZE) {
@@ -1246,7 +1710,7 @@ export async function adminPromoteStudents(fromStageId: StageId, toStageId: Stag
     }
     await syncStudentsBundle(cachedDb.students, Date.now());
   } catch (err) {
-    recordCloudError(err, OperationType.WRITE, 'students');
+    if (!bridgeUrl) recordCloudError(err, OperationType.WRITE, 'students');
   }
 
   return { success: true, promotedCount: promotedIds.length, promotedStudents };
@@ -1268,13 +1732,20 @@ export async function adminSaveQuestion(question: Partial<Question>) {
     cachedDb.questions.push(qData);
   }
 
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    await pushSheetsAdminTab('saveQuestions');
+  }
+
   try {
     await setDoc(doc(dbLite, 'questions', targetId), qData);
     await syncQuestionsBundle(cachedDb.questions, Date.now());
     clearCloudError();
   } catch (err) {
-    recordCloudError(err, OperationType.WRITE, `questions/${targetId}`);
-    throw new Error(lastCloudErrorMessage || 'Gagal menyimpan soal ke server.');
+    if (!bridgeUrl) {
+      recordCloudError(err, OperationType.WRITE, `questions/${targetId}`);
+      throw new Error(lastCloudErrorMessage || 'Gagal menyimpan soal ke server.');
+    }
   }
 
   return { success: true, question: qData };
@@ -1282,11 +1753,15 @@ export async function adminSaveQuestion(question: Partial<Question>) {
 
 export async function adminDeleteQuestion(id: string) {
   cachedDb.questions = cachedDb.questions.filter(q => q.id !== id);
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    await pushSheetsAdminTab('saveQuestions');
+  }
   try {
     await deleteDoc(doc(dbLite, 'questions', id));
     await syncQuestionsBundle(cachedDb.questions, Date.now());
   } catch (err) {
-    recordCloudError(err, OperationType.DELETE, `questions/${id}`);
+    if (!bridgeUrl) recordCloudError(err, OperationType.DELETE, `questions/${id}`);
   }
   return { success: true };
 }
@@ -1309,13 +1784,20 @@ export async function adminSaveStudent(student: Partial<Student>) {
     cachedDb.students.push(sData);
   }
 
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    await pushSheetsAdminTab('saveStudents');
+  }
+
   try {
     await setDoc(doc(dbLite, 'students', targetId), sData);
     await syncStudentsBundle(cachedDb.students, Date.now());
     clearCloudError();
   } catch (err) {
-    recordCloudError(err, OperationType.WRITE, `students/${targetId}`);
-    throw new Error(lastCloudErrorMessage || 'Gagal menyimpan data siswa ke server.');
+    if (!bridgeUrl) {
+      recordCloudError(err, OperationType.WRITE, `students/${targetId}`);
+      throw new Error(lastCloudErrorMessage || 'Gagal menyimpan data siswa ke server.');
+    }
   }
 
   return { success: true, student: sData };
@@ -1325,11 +1807,16 @@ export async function adminDeleteStudent(id: string) {
   cachedDb.students = cachedDb.students.filter(s => s.id !== id);
   cachedDb.submissions = cachedDb.submissions.filter(sub => sub.studentId !== id);
 
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    await pushSheetsAdminTab('saveStudents');
+  }
+
   try {
     await deleteDoc(doc(dbLite, 'students', id));
     await syncStudentsBundle(cachedDb.students, Date.now());
   } catch (err) {
-    recordCloudError(err, OperationType.DELETE, `students/${id}`);
+    if (!bridgeUrl) recordCloudError(err, OperationType.DELETE, `students/${id}`);
   }
 
   return { success: true };
@@ -1365,6 +1852,11 @@ export async function adminBulkSeedStudents() {
 
   cachedDb.students.push(...newGenerated);
 
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    await pushSheetsAdminTab('saveStudents');
+  }
+
   try {
     const batch = writeBatch(dbLite);
     newGenerated.forEach(st => {
@@ -1373,7 +1865,7 @@ export async function adminBulkSeedStudents() {
     await batch.commit();
     await syncStudentsBundle(cachedDb.students, Date.now());
   } catch (err) {
-    recordCloudError(err, OperationType.WRITE, 'students');
+    if (!bridgeUrl) recordCloudError(err, OperationType.WRITE, 'students');
   }
 
   return { success: true, addedCount: newGenerated.length, total: cachedDb.students.length };
@@ -1447,6 +1939,11 @@ export async function adminImportStudentsFromCSV(csvText: string): Promise<{ suc
     }
   });
 
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    await pushSheetsAdminTab('saveStudents');
+  }
+
   try {
     const CHUNK_SIZE = 400;
     for (let c = 0; c < parsedStudents.length; c += CHUNK_SIZE) {
@@ -1460,27 +1957,116 @@ export async function adminImportStudentsFromCSV(csvText: string): Promise<{ suc
 
     await syncStudentsBundle(cachedDb.students, Date.now());
   } catch (err) {
-    recordCloudError(err, OperationType.WRITE, 'students');
-    throw new Error(lastCloudErrorMessage || 'Gagal mengimpor data CSV ke server.');
+    if (!bridgeUrl) {
+      recordCloudError(err, OperationType.WRITE, 'students');
+      throw new Error(lastCloudErrorMessage || 'Gagal mengimpor data CSV ke server.');
+    }
   }
 
   return { success: true, addedCount: parsedStudents.length, total: cachedDb.students.length };
 }
 
-export async function adminResetProgress(stageId: string = 'all') {
+function clearStudentDraftKeys(studentId?: string, stageId: string = 'all') {
+  try {
+    const stageIds: StageId[] =
+      stageId === 'all'
+        ? ['penyisihan', 'top30', 'semifinal', 'final']
+        : [stageId as StageId];
+
+    if (studentId) {
+      stageIds.forEach(st => {
+        localStorage.removeItem(getDraftKey(studentId, st));
+      });
+      return;
+    }
+
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith('gelora26_draft_')) continue;
+      if (stageId === 'all' || stageIds.some(st => k.endsWith(`_${st}`))) {
+        keysToRemove.push(k);
+      }
+    }
+    keysToRemove.forEach(k => localStorage.removeItem(k));
+  } catch {
+    // ignore
+  }
+}
+
+export async function adminResetProgress(
+  stageId: string = 'all',
+  options?: { preserveStudents?: boolean }
+) {
+  const preserveStudents = Boolean(options?.preserveStudents);
+
   if (stageId && stageId !== 'all') {
     cachedDb.submissions = cachedDb.submissions.filter(s => s.stageId !== stageId);
     Object.keys(cachedProgressMap).forEach(k => {
       if (cachedProgressMap[k].stageId === stageId) delete cachedProgressMap[k];
     });
+    clearStudentDraftKeys(undefined, stageId);
   } else {
     cachedDb.submissions = [];
     cachedProgressMap = {};
-    cachedDb.students.forEach(st => {
-      st.qualifiedStage = 'penyisihan';
-      st.status = 'aktif';
-    });
+    clearStudentDraftKeys(undefined, 'all');
+    if (!preserveStudents) {
+      cachedDb.students.forEach(st => {
+        st.qualifiedStage = 'penyisihan';
+        st.status = 'aktif';
+      });
+    }
   }
+
+  let nextLeaderboard = computeLeaderboard(
+    cachedDb.students,
+    cachedDb.submissions,
+    cachedDb.activeStageId,
+    Object.values(cachedProgressMap)
+  );
+
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    const tabular = buildTabularSheetsPayload({
+      activeStageId: cachedDb.activeStageId,
+      stages: cachedDb.stages,
+      students: cachedDb.students,
+      questions: cachedDb.questions,
+      progressList: [],
+      leaderboard: []
+    });
+    try {
+      const gsRes = await sheetsBridgePost(bridgeUrl, {
+        action: 'resetProgress',
+        stageId,
+        ...(stageId === 'all' && !preserveStudents ? { studentRows: tabular.studentRows } : {})
+      });
+      if (Array.isArray(gsRes?.leaderboard)) {
+        nextLeaderboard = gsRes.leaderboard as LeaderboardRank[];
+      }
+    } catch (err: any) {
+      const msg = String(err?.message || err || '');
+      if (msg.includes('getSheetByName is not a function')) {
+        throw new Error(
+          'Kode Apps Script di Google Sheets Anda masih versi lama. Buka Tab 5 (Google Drive) → Salin Kode v4 terbaru → tempel di Apps Script → Deploy → Manage deployments → New version.'
+        );
+      }
+      throw err;
+    }
+  }
+
+  cachedLeaderboard = nextLeaderboard;
+  saveLocalCache({
+    activeStageId: cachedDb.activeStageId,
+    stages: cachedDb.stages,
+    students: cachedDb.students,
+    questions: cachedDb.questions,
+    announcement: cachedDb.announcement,
+    studentsVersion: cachedStudentsVersion,
+    questionsVersion: cachedQuestionsVersion,
+    leaderboard: cachedLeaderboard.slice(0, 50),
+    savedAt: Date.now()
+  });
 
   try {
     const subSnaps = await getDocs(collection(dbLite, 'submissions'));
@@ -1507,7 +2093,31 @@ export async function adminResetProgress(stageId: string = 'all') {
       await batch.commit();
     }
 
-    if (stageId === 'all') {
+    const stagesToUpdate: StageId[] =
+      stageId === 'all'
+        ? ['penyisihan', 'top30', 'semifinal', 'final']
+        : [stageId as StageId];
+    const now = Date.now();
+    for (const sId of stagesToUpdate) {
+      const zeroRankings = computeLeaderboard(
+        cachedDb.students,
+        cachedDb.submissions,
+        sId,
+        Object.values(cachedProgressMap)
+      );
+      await setDoc(doc(dbLite, 'app_state', `leaderboard_${sId}`), {
+        stageId: sId,
+        updatedAt: now,
+        rankings: zeroRankings.slice(0, 200)
+      });
+    }
+    await setDoc(
+      doc(dbLite, 'app_state', 'submission_signal'),
+      { lastSubmissionAt: now, action: 'resetProgress' },
+      { merge: true }
+    );
+
+    if (stageId === 'all' && !preserveStudents) {
       for (let i = 0; i < cachedDb.students.length; i += CHUNK_SIZE) {
         const studentBatch = writeBatch(dbLite);
         cachedDb.students.slice(i, i + CHUNK_SIZE).forEach(st => {
@@ -1522,10 +2132,116 @@ export async function adminResetProgress(stageId: string = 'all') {
       await syncStudentsBundle(cachedDb.students, Date.now());
     }
   } catch (err) {
-    recordCloudError(err, OperationType.DELETE, 'submissions');
+    if (!bridgeUrl) recordCloudError(err, OperationType.DELETE, 'submissions');
   }
 
   return { success: true };
+}
+
+export async function adminDeleteStudentScore(
+  studentId: string,
+  stageId: StageId | 'all' = cachedDb.activeStageId
+) {
+  if (!studentId) {
+    throw new Error('ID siswa tidak valid.');
+  }
+
+  cachedDb.submissions = cachedDb.submissions.filter(
+    s => !(s.studentId === studentId && (stageId === 'all' || s.stageId === stageId))
+  );
+  Object.keys(cachedProgressMap).forEach(k => {
+    const p = cachedProgressMap[k];
+    if (p && p.studentId === studentId && (stageId === 'all' || p.stageId === stageId)) {
+      delete cachedProgressMap[k];
+    }
+  });
+  clearStudentDraftKeys(studentId, stageId);
+
+  let nextLeaderboard = computeLeaderboard(
+    cachedDb.students,
+    cachedDb.submissions,
+    cachedDb.activeStageId,
+    Object.values(cachedProgressMap)
+  );
+
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    try {
+      const gsRes = await sheetsBridgePost(bridgeUrl, {
+        action: 'resetStudentScore',
+        studentId,
+        stageId
+      });
+      if (Array.isArray(gsRes?.leaderboard)) {
+        nextLeaderboard = gsRes.leaderboard as LeaderboardRank[];
+      }
+    } catch (err: any) {
+      const msg = String(err?.message || err || '');
+      if (msg.includes('Aksi POST tidak dikenali') || msg.includes('getSheetByName')) {
+        throw new Error(
+          'Google Apps Script Anda belum mendukung hapus skor per siswa. Buka Tab 5 (Google Drive) → Salin Kode v4 terbaru → tempel di Apps Script → Deploy → Manage deployments → New version.'
+        );
+      }
+      throw err;
+    }
+  }
+
+  cachedLeaderboard = nextLeaderboard;
+  saveLocalCache({
+    activeStageId: cachedDb.activeStageId,
+    stages: cachedDb.stages,
+    students: cachedDb.students,
+    questions: cachedDb.questions,
+    announcement: cachedDb.announcement,
+    studentsVersion: cachedStudentsVersion,
+    questionsVersion: cachedQuestionsVersion,
+    leaderboard: cachedLeaderboard.slice(0, 50),
+    savedAt: Date.now()
+  });
+
+  try {
+    const subSnaps = await getDocs(
+      query(collection(dbLite, 'submissions'), where('studentId', '==', studentId))
+    );
+    const deleteRefs: any[] = [];
+    subSnaps.forEach(docSnap => {
+      const data = docSnap.data();
+      if (stageId === 'all' || data.stageId === stageId) {
+        deleteRefs.push(docSnap.ref);
+      }
+    });
+
+    const targetStages: StageId[] =
+      stageId === 'all'
+        ? ['penyisihan', 'top30', 'semifinal', 'final']
+        : [stageId as StageId];
+    targetStages.forEach(sId => {
+      deleteRefs.push(doc(dbLite, 'student_progress', `${studentId}_${sId}`));
+    });
+
+    const CHUNK_SIZE = 400;
+    for (let i = 0; i < deleteRefs.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(dbLite);
+      deleteRefs.slice(i, i + CHUNK_SIZE).forEach(ref => batch.delete(ref));
+      await batch.commit();
+    }
+
+    const now = Date.now();
+    await setDoc(doc(dbLite, 'app_state', `leaderboard_${cachedDb.activeStageId}`), {
+      stageId: cachedDb.activeStageId,
+      updatedAt: now,
+      rankings: nextLeaderboard.slice(0, 200)
+    });
+    await setDoc(
+      doc(dbLite, 'app_state', 'submission_signal'),
+      { lastSubmissionAt: now, studentId, action: 'resetStudentScore' },
+      { merge: true }
+    );
+  } catch (err) {
+    if (!bridgeUrl) recordCloudError(err, OperationType.DELETE, `student_progress/${studentId}`);
+  }
+
+  return { success: true, leaderboard: nextLeaderboard };
 }
 
 export function exportDatabaseBackup(): string {
@@ -1588,6 +2304,13 @@ export function getServerStatus(): boolean {
 
 export async function sendRealtimePing(): Promise<number> {
   const timestamp = Date.now();
+  const bridgeUrl = getActiveGoogleSheetsBridgeUrl();
+  if (bridgeUrl) {
+    await sheetsBridgePost(bridgeUrl, { action: 'ping' });
+    cachedAppStateUpdatedAt = timestamp;
+    return timestamp;
+  }
+
   await setDoc(
     doc(dbLite, 'app_state', 'main'),
     {
@@ -1598,6 +2321,95 @@ export async function sendRealtimePing(): Promise<number> {
   );
   cachedAppStateUpdatedAt = timestamp;
   return timestamp;
+}
+
+export async function getAdminProgressSnapshot(): Promise<StudentProgress[]> {
+  const current = Object.values(cachedProgressMap);
+  if (current.length > 0) return current;
+
+  try {
+    const snap = await getDocs(collection(dbLite, 'student_progress'));
+    const list: StudentProgress[] = [];
+    snap.forEach(docSnap => {
+      const p = docSnap.data() as StudentProgress;
+      cachedProgressMap[docSnap.id] = p;
+      list.push(p);
+    });
+    return list;
+  } catch {
+    return [];
+  }
+}
+
+export async function adminSyncFromGoogleSheets(payload: {
+  students: Student[];
+  questions: Question[];
+  activeStageId?: StageId;
+  stages?: Record<StageId, any>;
+}): Promise<{ studentsUpdated: number; questionsUpdated: number }> {
+  const now = Date.now();
+  const docsToWrite: Array<{ ref: any; data: any }> = [];
+
+  if (payload.students.length > 0) {
+    const studentMap = new Map(cachedDb.students.map(s => [s.noPeserta.toUpperCase(), s]));
+    payload.students.forEach(st => {
+      const key = st.noPeserta.toUpperCase();
+      const existing = studentMap.get(key);
+      const merged: Student = existing ? { ...existing, ...st, id: existing.id || st.id } : st;
+      studentMap.set(key, merged);
+      docsToWrite.push({ ref: doc(dbLite, 'students', merged.id), data: stripUndefined(merged) });
+    });
+    cachedDb.students = Array.from(studentMap.values());
+  }
+
+  if (payload.questions.length > 0) {
+    const qMap = new Map(cachedDb.questions.map(q => [q.id, q]));
+    payload.questions.forEach(q => {
+      const existing = qMap.get(q.id);
+      const merged: Question = existing ? { ...existing, ...q } : q;
+      qMap.set(merged.id, merged);
+      docsToWrite.push({ ref: doc(dbLite, 'questions', merged.id), data: stripUndefined(merged) });
+    });
+    cachedDb.questions = Array.from(qMap.values());
+  }
+
+  if (payload.activeStageId) {
+    cachedDb.activeStageId = payload.activeStageId;
+  }
+  if (payload.stages) {
+    cachedDb.stages = payload.stages;
+  }
+
+  const CHUNK_SIZE = 400;
+  for (let i = 0; i < docsToWrite.length; i += CHUNK_SIZE) {
+    const batch = writeBatch(dbLite);
+    docsToWrite.slice(i, i + CHUNK_SIZE).forEach(item => batch.set(item.ref, item.data, { merge: true }));
+    await batch.commit();
+  }
+
+  if (payload.students.length > 0) {
+    await syncStudentsBundle(cachedDb.students, now);
+  }
+  if (payload.questions.length > 0) {
+    await syncQuestionsBundle(cachedDb.questions, now + 1);
+  }
+  if (payload.activeStageId || payload.stages) {
+    await setDoc(
+      doc(dbLite, 'app_state', 'main'),
+      {
+        activeStageId: cachedDb.activeStageId,
+        stages: cachedDb.stages,
+        updatedAt: now + 2
+      },
+      { merge: true }
+    );
+    cachedAppStateUpdatedAt = now + 2;
+  }
+
+  return {
+    studentsUpdated: payload.students.length,
+    questionsUpdated: payload.questions.length
+  };
 }
 
 // ====================================================
@@ -1746,80 +2558,220 @@ export function subscribeToRealtimeUpdates(
   );
 
   // ====================================================
-  // LAYER 1: Full-SDK onSnapshot (instant push when Listen streams are within quota)
+  // LAYER 1: Full-SDK onSnapshot (only when NOT in Google Sheets Primary mode)
+  // Wait for resolveActiveSheetsBridgeUrl() so we don't fire unnecessary Firestore streams on boot!
   // ====================================================
-  try {
-    const unsubAppState = onSnapshot(
-      docFull(db, 'app_state', 'main'),
-      async docSnap => {
-        if (isDisposed || !docSnap.exists()) return;
-        snapshotHealthy = true;
-        await processAppStateData(docSnap.data(), onEvent, userRole);
-      },
-      error => {
-        snapshotHealthy = false;
-        console.warn('onSnapshot(app_state/main) fallback to REST sync:', error?.message || error);
-      }
-    );
-    unsubscribers.push(unsubAppState);
-
-    if (userRole === 'admin') {
-      const unsubProgress = onSnapshot(
-        collectionFull(db, 'student_progress'),
-        (snapshot: any) => {
-          if (isDisposed) return;
+  const attachFirestoreSnapshotsIfNeeded = async () => {
+    const activeBridge = await resolveActiveSheetsBridgeUrl();
+    if (isDisposed || activeBridge) return;
+    try {
+      const unsubAppState = onSnapshot(
+        docFull(db, 'app_state', 'main'),
+        async docSnap => {
+          if (isDisposed || !docSnap.exists() || getActiveGoogleSheetsBridgeUrl()) return;
           snapshotHealthy = true;
-          clearCloudError();
-          const progressList: StudentProgress[] = [];
-          cachedProgressMap = {};
-          snapshot.forEach((docSnap: any) => {
-            const p = docSnap.data() as StudentProgress;
-            cachedProgressMap[docSnap.id] = p;
-            progressList.push(p);
-          });
-
-          const currentLeaderboard = computeLeaderboard(
-            cachedDb.students,
-            cachedDb.submissions,
-            cachedDb.activeStageId,
-            progressList
-          );
-          cachedLeaderboard = currentLeaderboard;
-          scheduleLeaderboardSummarySync(cachedDb.activeStageId, currentLeaderboard);
-
-          onEvent({
-            type: 'SUBMISSION_RECEIVED',
-            data: { leaderboard: currentLeaderboard }
-          });
+          await processAppStateData(docSnap.data(), onEvent, userRole);
         },
-        (error: any) => {
+        error => {
           snapshotHealthy = false;
-          console.warn('onSnapshot(student_progress) fallback to REST sync:', error?.message || error);
+          console.warn('onSnapshot(app_state/main) fallback to REST sync:', error?.message || error);
         }
       );
-      unsubscribers.push(unsubProgress);
+      unsubscribers.push(unsubAppState);
+
+      if (userRole === 'admin') {
+        const unsubProgress = onSnapshot(
+          collectionFull(db, 'student_progress'),
+          (snapshot: any) => {
+            if (isDisposed || getActiveGoogleSheetsBridgeUrl()) return;
+            snapshotHealthy = true;
+            clearCloudError();
+            const progressList: StudentProgress[] = [];
+            cachedProgressMap = {};
+            snapshot.forEach((docSnap: any) => {
+              const p = docSnap.data() as StudentProgress;
+              cachedProgressMap[docSnap.id] = p;
+              progressList.push(p);
+            });
+
+            const currentLeaderboard = computeLeaderboard(
+              cachedDb.students,
+              cachedDb.submissions,
+              cachedDb.activeStageId,
+              progressList
+            );
+            cachedLeaderboard = currentLeaderboard;
+            scheduleLeaderboardSummarySync(cachedDb.activeStageId, currentLeaderboard);
+
+            onEvent({
+              type: 'SUBMISSION_RECEIVED',
+              data: { leaderboard: currentLeaderboard }
+            });
+          },
+          (error: any) => {
+            snapshotHealthy = false;
+            console.warn('onSnapshot(student_progress) fallback to REST sync:', error?.message || error);
+          }
+        );
+        unsubscribers.push(unsubProgress);
+      }
+    } catch (err) {
+      snapshotHealthy = false;
+      console.warn('Could not attach full-SDK listeners, using REST sync:', err);
     }
-  } catch (err) {
-    snapshotHealthy = false;
-    console.warn('Could not attach full-SDK listeners, using REST sync:', err);
-  }
+  };
+  attachFirestoreSnapshotsIfNeeded();
 
   // ====================================================
-  // LAYER 2: Resilient Adaptive REST Sync (dbLite)
-  // Automatically runs fast when onSnapshot is blocked/disconnected!
+  // LAYER 2: Resilient Adaptive REST Sync (Google Sheets Primary / dbLite)
   // ====================================================
   let pollInFlight = false;
   let pollTimer: any = null;
   let pollTick = 0;
+  let lastSeenPollUpdated: number | null = null;
+  let lastSeenPollSubAt: number | null = null;
+  let lastSeenPollStudentsVer: number | null = null;
+  let lastSeenPollQuestionsVer: number | null = null;
+  let didInitialAdminProgressPull = false;
 
   const runRestSync = async () => {
     if (isDisposed || pollInFlight) return;
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
 
     pollInFlight = true;
     pollTick += 1;
 
     try {
+      // Keep visibility guard INSIDE try so finally always reschedules pollTimer when tab goes hidden/visible
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+
+      const bridgeUrl = await resolveActiveSheetsBridgeUrl(pollTick === 1 || pollTick % 25 === 0);
+
+      // ====================================================
+      // GOOGLE SHEETS PRIMARY REALTIME POLLING
+      // ====================================================
+      if (bridgeUrl) {
+        const poll = await sheetsBridgeGet(bridgeUrl, {
+          action: 'poll',
+          role: userRole || 'student',
+          stageId: cachedDb.activeStageId
+        });
+
+        const pollUpdated = Number(poll.updatedAt || 0);
+        const pollStudentsVer = Number(poll.studentsVersion || 0);
+        const pollQuestionsVer = Number(poll.questionsVersion || 0);
+        const pollSubAt = Number(poll.lastSubmissionAt || 0);
+        const stageDiff = Boolean(poll.activeStageId && poll.activeStageId !== cachedDb.activeStageId);
+
+        const prevUpdatedAt = cachedAppStateUpdatedAt;
+        const prevStudentsVer = cachedStudentsVersion;
+        const prevQuestionsVer = cachedQuestionsVersion;
+        const prevStudentCount = cachedDb.students.length;
+        const prevQuestionCount = cachedDb.questions.length;
+        const prevStage = cachedDb.activeStageId;
+        const prevSubAt = Math.max(lastKnownSubmissionSignal, cachedLastSubmissionAt);
+
+        const stateNeedsFullRefresh =
+          stageDiff ||
+          (pollUpdated > 0 && pollUpdated !== prevUpdatedAt) ||
+          (lastSeenPollUpdated !== null && pollUpdated !== lastSeenPollUpdated) ||
+          (pollStudentsVer > 0 && pollStudentsVer !== prevStudentsVer) ||
+          (lastSeenPollStudentsVer !== null && pollStudentsVer !== lastSeenPollStudentsVer) ||
+          (pollQuestionsVer > 0 && pollQuestionsVer !== prevQuestionsVer) ||
+          (lastSeenPollQuestionsVer !== null && pollQuestionsVer !== lastSeenPollQuestionsVer);
+
+        const submissionChanged =
+          userRole === 'admin' &&
+          (!didInitialAdminProgressPull ||
+            (pollSubAt > 0 && pollSubAt !== prevSubAt) ||
+            (lastSeenPollSubAt !== null && pollSubAt !== lastSeenPollSubAt));
+
+        lastSeenPollUpdated = pollUpdated;
+        lastSeenPollSubAt = pollSubAt;
+        lastSeenPollStudentsVer = pollStudentsVer;
+        lastSeenPollQuestionsVer = pollQuestionsVer;
+
+        if (stateNeedsFullRefresh) {
+          const stateRes = await fetchStateFromGoogleSheetsBridge(bridgeUrl, userRole);
+          lastKnownSubmissionSignal = pollSubAt;
+          cachedLastSubmissionAt = pollSubAt;
+          if (userRole === 'admin') {
+            didInitialAdminProgressPull = true;
+          }
+
+          if (cachedStudentsVersion !== prevStudentsVer || stateRes.students.length !== prevStudentCount) {
+            onEvent({
+              type: 'STUDENTS_UPDATED',
+              data: { students: stateRes.students, leaderboard: stateRes.leaderboard }
+            });
+          }
+          if (cachedQuestionsVersion !== prevQuestionsVer || stateRes.questions.length !== prevQuestionCount) {
+            onEvent({
+              type: 'STATE_UPDATED',
+              data: { questions: stateRes.questions }
+            });
+          }
+          if (stateRes.activeStageId !== prevStage || pollUpdated !== prevUpdatedAt) {
+            onEvent({
+              type: 'STAGE_ACTIVATED',
+              data: {
+                activeStageId: stateRes.activeStageId,
+                stages: stateRes.stages,
+                announcement: stateRes.announcement,
+                leaderboard: stateRes.leaderboard
+              }
+            });
+          }
+          if (userRole === 'admin' && (submissionChanged || pollSubAt > 0)) {
+            onEvent({
+              type: 'SUBMISSION_RECEIVED',
+              data: { leaderboard: stateRes.leaderboard }
+            });
+          }
+        } else if (submissionChanged) {
+          // Fast lightweight progress sync (~800 bytes instead of 200 KB!)
+          const progRes = await sheetsBridgeGet(bridgeUrl, { action: 'adminProgress' });
+          if (Array.isArray(progRes?.rows)) {
+            didInitialAdminProgressPull = true;
+            const progressList = parseProgressRowsFromSheet(progRes.rows);
+            cachedProgressMap = {};
+            progressList.forEach(p => {
+              cachedProgressMap[`${p.studentId}_${p.stageId}`] = p;
+            });
+            const nextLb = computeLeaderboard(
+              cachedDb.students,
+              [],
+              cachedDb.activeStageId,
+              progressList
+            );
+            cachedLeaderboard = nextLb;
+            lastKnownSubmissionSignal = pollSubAt;
+            cachedLastSubmissionAt = pollSubAt;
+            saveLocalCache({
+              activeStageId: cachedDb.activeStageId,
+              stages: cachedDb.stages,
+              students: cachedDb.students,
+              questions: cachedDb.questions,
+              announcement: cachedDb.announcement,
+              studentsVersion: cachedStudentsVersion,
+              questionsVersion: cachedQuestionsVersion,
+              leaderboard: nextLb.slice(0, 50),
+              savedAt: Date.now()
+            });
+            clearCloudError();
+            onEvent({
+              type: 'SUBMISSION_RECEIVED',
+              data: { leaderboard: nextLb }
+            });
+          }
+        } else {
+          clearCloudError();
+        }
+        return;
+      }
+
+      // ====================================================
+      // FIRESTORE ADAPTIVE REST SYNC
+      // ====================================================
       // 1. Check app_state/main (1 read)
       const checkMain = userRole !== 'admin' || !snapshotHealthy || pollTick % 3 === 1;
       if (checkMain) {
@@ -1885,30 +2837,35 @@ export function subscribeToRealtimeUpdates(
         }
       }
     } catch (err) {
-      const kind = recordCloudError(err, OperationType.GET, 'app_state/main');
-      onEvent({
-        type: 'CLOUD_ERROR',
-        data: { kind, message: lastCloudErrorMessage }
-      });
+      if (!getActiveGoogleSheetsBridgeUrl()) {
+        const kind = recordCloudError(err, OperationType.GET, 'app_state/main');
+        onEvent({
+          type: 'CLOUD_ERROR',
+          data: { kind, message: lastCloudErrorMessage }
+        });
+      }
     } finally {
       pollInFlight = false;
       if (!isDisposed) {
-        // Admin polls faster (3s when fallback, 8s backup); Students poll 6s when fallback, 15s backup
-        const nextDelay =
-          userRole === 'admin'
-            ? snapshotHealthy
-              ? 8000
-              : 3000
-            : snapshotHealthy
-            ? 15000
-            : 6000;
+        const sheetsMode = Boolean(getActiveGoogleSheetsBridgeUrl());
+        const nextDelay = sheetsMode
+          ? userRole === 'admin'
+            ? 3000
+            : 5000
+          : userRole === 'admin'
+          ? snapshotHealthy
+            ? 8000
+            : 3000
+          : snapshotHealthy
+          ? 15000
+          : 6000;
         pollTimer = setTimeout(runRestSync, nextDelay);
       }
     }
   };
 
-  // Start REST sync heartbeat after brief delay (3s)
-  pollTimer = setTimeout(runRestSync, 3000);
+  // Start REST sync heartbeat after brief delay (1.5s)
+  pollTimer = setTimeout(runRestSync, 1500);
 
   // Immediately sync when mobile user wakes screen or switches back to browser tab
   const handleVisibility = () => {

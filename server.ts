@@ -1,10 +1,14 @@
 import express, { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { initialQuestions, initialStages, initialStudents } from './src/seedData.ts';
 import { AnswerSubmission, AppDatabaseState, LeaderboardRank, Question, StageId, Student, StudentProgress } from './src/types.ts';
+
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -599,6 +603,171 @@ async function startServer() {
     saveDatabase(db);
     broadcastRealtimeEvent('STATE_RESET', { stageId });
     res.json({ success: true });
+  });
+
+  async function resolveBakedSheetsConfigJson(queryBridgeUrl: string): Promise<string> {
+    let fbProjectId = 'gen-lang-client-0351144099';
+    let fbDbId = 'ai-studio-remixgelora26lom-27d71874-5d97-4641-9dcc-154ea1707e4d';
+    try {
+      const fbCfgPath = path.join(__dirname, 'firebase-applet-config.json');
+      if (fs.existsSync(fbCfgPath)) {
+        const fbCfg = JSON.parse(fs.readFileSync(fbCfgPath, 'utf-8'));
+        fbProjectId = fbCfg.projectId || fbProjectId;
+        fbDbId = fbCfg.firestoreDatabaseId || fbDbId;
+      }
+    } catch {
+      // ignore
+    }
+
+    let remoteCfg: Record<string, any> | null = null;
+    if (fbProjectId && fbDbId) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      try {
+        const restUrl = `https://firestore.googleapis.com/v1/projects/${fbProjectId}/databases/${fbDbId}/documents/app_state/sheets_config`;
+        const fbRes = await fetch(restUrl, { signal: controller.signal });
+        if (fbRes.ok) {
+          const fbDoc: any = await fbRes.json();
+          const fields = fbDoc?.fields;
+          if (fields) {
+            remoteCfg = {
+              spreadsheetId: String(fields.spreadsheetId?.stringValue || ''),
+              spreadsheetTitle: String(fields.spreadsheetTitle?.stringValue || 'GELORA 26 Database'),
+              spreadsheetUrl: String(fields.spreadsheetUrl?.stringValue || ''),
+              bridgeWebAppUrl: String(fields.bridgeWebAppUrl?.stringValue || ''),
+              connectionMode: String(fields.connectionMode?.stringValue || 'apps_script'),
+              useSheetsAsPrimaryDb: Boolean(fields.useSheetsAsPrimaryDb?.booleanValue),
+              lastSyncedAt: Number(fields.lastSyncedAt?.integerValue ?? fields.lastSyncedAt?.doubleValue ?? 0) || Date.now(),
+              updatedAt: Number(fields.updatedAt?.integerValue ?? fields.updatedAt?.doubleValue ?? 0) || Date.now()
+            };
+          }
+        }
+      } catch {
+        // ignore
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    if (queryBridgeUrl.startsWith('https://script.google.com/')) {
+      return JSON.stringify(
+        {
+          spreadsheetId: remoteCfg?.spreadsheetId || '',
+          spreadsheetTitle: remoteCfg?.spreadsheetTitle || 'GELORA 26 Database',
+          spreadsheetUrl: remoteCfg?.spreadsheetUrl || '',
+          bridgeWebAppUrl: queryBridgeUrl,
+          connectionMode: 'apps_script',
+          useSheetsAsPrimaryDb: true,
+          lastSyncedAt: remoteCfg?.lastSyncedAt || Date.now(),
+          updatedAt: Date.now()
+        },
+        null,
+        2
+      );
+    }
+
+    if (
+      remoteCfg &&
+      remoteCfg.useSheetsAsPrimaryDb &&
+      typeof remoteCfg.bridgeWebAppUrl === 'string' &&
+      remoteCfg.bridgeWebAppUrl.startsWith('https://script.google.com/')
+    ) {
+      return JSON.stringify(remoteCfg, null, 2);
+    }
+
+    return '';
+  }
+
+  function injectConfigIntoHtml(html: string, bakedConfigJson: string): string {
+    if (!bakedConfigJson) return html;
+    const safeJson = bakedConfigJson.replace(/</g, '\\u003c');
+    const injectScript = `<script>window.__GELORA_SHEETS_CONFIG__=${safeJson};</script>`;
+    if (html.includes('</head>')) {
+      return html.replace('</head>', `${injectScript}\n  </head>`);
+    }
+    return `${injectScript}\n${html}`;
+  }
+
+  // Export single self-contained index.html file (JS + CSS + Banner + Active Google Sheets URL all embedded inside!)
+  app.get('/api/export-single-html', async (req: Request, res: Response) => {
+    try {
+      const distDir = path.join(__dirname, 'dist');
+      const indexHtmlPath = path.join(distDir, 'index.html');
+      if (!fs.existsSync(indexHtmlPath)) {
+        await execFileAsync('npm', ['run', 'build'], { cwd: __dirname });
+      }
+      if (!fs.existsSync(indexHtmlPath)) {
+        return res.status(500).json({ error: 'File dist/index.html belum tersedia.' });
+      }
+
+      const queryBridgeUrl = typeof req.query.bridgeUrl === 'string' ? req.query.bridgeUrl.trim() : '';
+      const bakedConfigJson = await resolveBakedSheetsConfigJson(queryBridgeUrl);
+      const rawHtml = fs.readFileSync(indexHtmlPath, 'utf-8');
+      const finalHtml = injectConfigIntoHtml(rawHtml, bakedConfigJson);
+
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="index.html"');
+      return res.send(finalHtml);
+    } catch (err: any) {
+      console.error('Export single html error:', err);
+      return res.status(500).json({ error: err?.message || 'Gagal membuat file index.html tunggal.' });
+    }
+  });
+
+  // Export built /dist folder as Netlify-ready ZIP archive (no local Node.js build required!)
+  app.get('/api/export-netlify-dist', async (req: Request, res: Response) => {
+    try {
+      const distDir = path.join(__dirname, 'dist');
+      const indexHtmlPath = path.join(distDir, 'index.html');
+      if (!fs.existsSync(indexHtmlPath)) {
+        await execFileAsync('npm', ['run', 'build'], { cwd: __dirname });
+      }
+      if (!fs.existsSync(indexHtmlPath)) {
+        return res.status(500).json({ error: 'Folder dist belum tersedia.' });
+      }
+
+      const queryBridgeUrl = typeof req.query.bridgeUrl === 'string' ? req.query.bridgeUrl.trim() : '';
+      const bakedConfigJson = await resolveBakedSheetsConfigJson(queryBridgeUrl);
+      const rawHtml = fs.readFileSync(indexHtmlPath, 'utf-8');
+      const finalHtml = injectConfigIntoHtml(rawHtml, bakedConfigJson);
+
+      const zipOutPath = path.join(DATA_DIR, 'gelora26-dist-siap-netlify.zip');
+      const tempHtmlPath = path.join(DATA_DIR, `_export_index_${Date.now()}.html`);
+      fs.writeFileSync(tempHtmlPath, finalHtml, 'utf-8');
+
+      try {
+        const pyScript = [
+          'import os, sys, zipfile',
+          'src, out, html_file = sys.argv[1], sys.argv[2], sys.argv[3]',
+          'baked = sys.argv[4] if len(sys.argv) > 4 else ""',
+          'with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:',
+          '  for root, _, files in os.walk(src):',
+          '    for f in files:',
+          '      rel = os.path.relpath(os.path.join(root, f), src)',
+          '      if rel == "index.html":',
+          '        continue',
+          '      if baked and rel == "sheets-config.json":',
+          '        continue',
+          '      full = os.path.join(root, f)',
+          '      zf.write(full, rel)',
+          '  zf.write(html_file, "index.html")',
+          '  if baked:',
+          '    zf.writestr("sheets-config.json", baked)'
+        ].join('\n');
+
+        await execFileAsync('python3', ['-c', pyScript, distDir, zipOutPath, tempHtmlPath, bakedConfigJson], { cwd: __dirname });
+      } finally {
+        try {
+          if (fs.existsSync(tempHtmlPath)) fs.unlinkSync(tempHtmlPath);
+        } catch {
+          // ignore
+        }
+      }
+      return res.download(zipOutPath, 'gelora26-dist-siap-netlify.zip');
+    } catch (err: any) {
+      console.error('Export dist zip error:', err);
+      return res.status(500).json({ error: err?.message || 'Gagal membuat file ZIP dist.' });
+    }
   });
 
   // Mount Vite middlewares in development

@@ -4,12 +4,13 @@ import {
   Trash2, Edit, Award, ExternalLink, ShieldCheck, LogOut, Download, 
   Radio, Sparkles, Filter, AlertCircle, FileText, Check, ChevronRight,
   Maximize2, Eye, Flame, Rocket, Globe, UploadCloud, DownloadCloud,
-  Server, Copy, FileCheck, HelpCircle, HardDrive, Smartphone, CheckCheck
+  Server, Copy, FileCheck, HelpCircle, HardDrive, Smartphone, CheckCheck, FileSpreadsheet, RotateCcw
 } from 'lucide-react';
 import { Question, StageId, Student, LeaderboardRank } from '../../types';
 import { 
   adminActivateStage, adminPromoteStudents, adminDeleteQuestion, 
   adminDeleteStudent, adminBulkSeedStudents, adminResetProgress,
+  adminDeleteStudentScore,
   adminSaveQuestion, adminSaveStudent, adminImportStudentsFromCSV,
   adminOptimizeCloudCache,
   exportDatabaseBackup, importDatabaseBackup, getCustomServerUrl,
@@ -17,6 +18,9 @@ import {
 } from '../../services/api';
 import { QuestionEditorModal } from './QuestionEditorModal';
 import { StudentEditorModal } from './StudentEditorModal';
+import { GoogleSheetsDatabaseCard } from './GoogleSheetsDatabaseCard';
+import { getActiveGoogleSheetsBridgeUrl, isGoogleSheetsPrimaryActive, testAppsScriptBridge } from '../../services/googleSheetsDb';
+import geloraBannerImg from '../../assets/banner';
 
 interface PanitiaDashboardProps {
   onLogout: () => void;
@@ -37,7 +41,7 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
   leaderboard,
   onRefreshState
 }) => {
-  const [activeTab, setActiveTab] = useState<'stages' | 'questions' | 'students' | 'leaderboard' | 'deploy'>('stages');
+  const [activeTab, setActiveTab] = useState<'stages' | 'questions' | 'students' | 'leaderboard' | 'sheets' | 'deploy'>('stages');
   
   // Filtering
   const [selectedStageFilter, setSelectedStageFilter] = useState<StageId | 'all'>('penyisihan');
@@ -60,7 +64,86 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
     onConfirm: () => void;
   } | null>(null);
   const [isImportingCsv, setIsImportingCsv] = useState(false);
+  const [downloadingDistZip, setDownloadingDistZip] = useState(false);
+  const [downloadingSingleHtml, setDownloadingSingleHtml] = useState(false);
+  const [appsScriptVersion, setAppsScriptVersion] = useState<number | null>(null);
   const studentCsvInputRef = useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    const activeBridge = getActiveGoogleSheetsBridgeUrl();
+    if (!activeBridge) return;
+    testAppsScriptBridge(activeBridge)
+      .then(info => {
+        if (typeof info.version === 'number') setAppsScriptVersion(info.version);
+      })
+      .catch(() => {});
+  }, [activeTab]);
+
+  const handleDownloadSingleHtml = async () => {
+    setDownloadingSingleHtml(true);
+    try {
+      const activeBridge = getActiveGoogleSheetsBridgeUrl();
+      const exportUrl = activeBridge
+        ? `/api/export-single-html?bridgeUrl=${encodeURIComponent(activeBridge)}`
+        : '/api/export-single-html';
+      const res = await fetch(exportUrl);
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('text/html')) {
+        throw new Error(
+          'Unduhan file index.html tunggal hanya tersedia saat membuka Dashboard Panitia dari Preview AI Studio.'
+        );
+      }
+      const htmlText = await res.text();
+      if (!htmlText.includes('<div id="root">')) {
+        throw new Error('File index.html hasil build tidak lengkap.');
+      }
+      const blob = new Blob([htmlText], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'index.html';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast('Berhasil mengunduh index.html tunggal! Siap dibuka langsung atau diunggah ke Netlify.');
+    } catch (err: any) {
+      showToast(err?.message || 'Gagal mengunduh file index.html.');
+    } finally {
+      setDownloadingSingleHtml(false);
+    }
+  };
+
+  const handleDownloadNetlifyZip = async () => {
+    setDownloadingDistZip(true);
+    try {
+      const activeBridge = getActiveGoogleSheetsBridgeUrl();
+      const exportUrl = activeBridge
+        ? `/api/export-netlify-dist?bridgeUrl=${encodeURIComponent(activeBridge)}`
+        : '/api/export-netlify-dist';
+      const res = await fetch(exportUrl);
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('zip')) {
+        throw new Error(
+          'Unduhan paket ZIP otomatis hanya tersedia saat membuka Dashboard Panitia dari Preview AI Studio (bukan dari Netlify statis).'
+        );
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'gelora26-dist-siap-netlify.zip';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast('Berhasil mengunduh gelora26-dist-siap-netlify.zip! Tinggal drag-and-drop ke Netlify Deploys.');
+    } catch (err: any) {
+      showToast(err?.message || 'Gagal mengunduh paket Netlify.');
+    } finally {
+      setDownloadingDistZip(false);
+    }
+  };
 
   const showToast = (msg: string) => {
     setSuccessToast(msg);
@@ -230,6 +313,55 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
     });
   };
 
+  const handleClearScoresAndRankings = (stageId: StageId | 'all') => {
+    const stageName = stageId === 'all' ? 'Semua Babak' : stages[stageId]?.name || stageId;
+    const isAll = stageId === 'all';
+    setConfirmModal({
+      isOpen: true,
+      title: isAll ? 'Hapus Semua Skor & Peringkat' : `Hapus Skor & Peringkat (${stageName})`,
+      message: isAll
+        ? 'Hapus SELURUH skor, riwayat jawaban siswa, dan peringkat di semua babak? Data 155+ siswa dan bank soal TIDAK akan terhapus.'
+        : `Hapus seluruh skor, riwayat jawaban, dan peringkat pada ${stageName}? Data siswa dan soal tetap aman.`,
+      confirmText: isAll ? 'Ya, Hapus Semua Skor' : 'Ya, Hapus Skor Babak Ini',
+      onConfirm: async () => {
+        setActionLoading(true);
+        try {
+          await adminResetProgress(stageId, { preserveStudents: true });
+          showToast(`Skor dan peringkat ${stageName} berhasil dihapus!`);
+          onRefreshState();
+        } catch (err: any) {
+          showToast('Gagal menghapus skor & peringkat: ' + err.message);
+        } finally {
+          setActionLoading(false);
+          setConfirmModal(null);
+        }
+      }
+    });
+  };
+
+  const handleDeleteStudentScore = (rankEntry: LeaderboardRank) => {
+    const stageName = stages[activeStageId]?.name || activeStageId;
+    setConfirmModal({
+      isOpen: true,
+      title: 'Hapus Skor Siswa',
+      message: `Hapus skor (${rankEntry.totalScore} poin) dan riwayat jawaban milik ${rankEntry.nama} (${rankEntry.noPeserta}) pada ${stageName}? Peringkat akan diperbarui otomatis dan siswa tetap terdaftar.`,
+      confirmText: 'Ya, Hapus Skor Siswa',
+      onConfirm: async () => {
+        setActionLoading(true);
+        try {
+          await adminDeleteStudentScore(rankEntry.studentId, activeStageId);
+          showToast(`Skor ${rankEntry.nama} berhasil dihapus!`);
+          onRefreshState();
+        } catch (err: any) {
+          showToast('Gagal menghapus skor siswa: ' + err.message);
+        } finally {
+          setActionLoading(false);
+          setConfirmModal(null);
+        }
+      }
+    });
+  };
+
   const handleDeleteQuestion = (id: string) => {
     setConfirmModal({
       isOpen: true,
@@ -374,7 +506,7 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl overflow-hidden bg-white/10 border border-white/20 p-0.5 shrink-0">
               <img 
-                src="/assets/aistudio/WhatsApp_Image_2026-11-04_at_10.53.59_691c768a.jpeg" 
+                src={geloraBannerImg} 
                 alt="Logo GELORA 26" 
                 className="w-full h-full object-cover rounded-lg"
               />
@@ -386,7 +518,7 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
                 </h1>
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-400/30">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
-                  Cloud Online
+                  {isGoogleSheetsPrimaryActive() ? 'Google Sheets Aktif' : 'Cloud Online'}
                 </span>
               </div>
               <p className="text-xs text-sky-200">
@@ -402,6 +534,15 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
               <span>Babak Aktif:</span>
               <strong className="text-amber-300 uppercase">{stages[activeStageId]?.name}</strong>
             </div>
+
+            <button
+              onClick={() => setActiveTab('sheets')}
+              className="px-3 py-1.5 bg-teal-400 hover:bg-teal-300 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1.5 shadow transition"
+              title="Simpan Database ke Google Drive (Google Sheets / AppSheet)"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">Google Sheets / AppSheet</span>
+            </button>
 
             <button
               onClick={() => setActiveTab('deploy')}
@@ -491,6 +632,18 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
           </button>
 
           <button
+            onClick={() => setActiveTab('sheets')}
+            className={`py-2 px-4 rounded-xl text-xs sm:text-sm font-bold flex items-center gap-2 whitespace-nowrap transition ${
+              activeTab === 'sheets'
+                ? 'bg-amber-400 text-slate-950 shadow-md'
+                : 'text-sky-100 hover:bg-white/10 hover:text-white'
+            }`}
+          >
+            <FileSpreadsheet className="w-4 h-4 text-emerald-300" />
+            <span>5. Google Drive (Sheets / AppSheet)</span>
+          </button>
+
+          <button
             onClick={() => setActiveTab('deploy')}
             className={`py-2 px-4 rounded-xl text-xs sm:text-sm font-bold flex items-center gap-2 whitespace-nowrap transition ${
               activeTab === 'deploy'
@@ -499,7 +652,7 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
             }`}
           >
             <Rocket className="w-4 h-4 text-amber-300" />
-            <span>5. Publikasi Netlify & Server</span>
+            <span>6. Publikasi Netlify & Server</span>
           </button>
         </div>
       </header>
@@ -1012,6 +1165,29 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
         {/* TAB 4: LIVE MONITOR & PERINGKAT REALTIME (REQUIREMENTS 6 & 7) */}
         {activeTab === 'leaderboard' && (
           <div className="space-y-6">
+
+            {isGoogleSheetsPrimaryActive() && appsScriptVersion !== null && appsScriptVersion < 5 && (
+              <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3 text-xs text-amber-950">
+                <div className="flex items-start gap-2.5">
+                  <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-bold text-sm">
+                      Google Apps Script Anda masih versi v{appsScriptVersion} (perlu update ke v5 untuk Status Login Live)
+                    </p>
+                    <p className="text-amber-800 mt-0.5">
+                      Jawaban &amp; skor tetap masuk, namun pencatatan otomatis saat siswa baru login (<strong>Sudah Login</strong>) membutuhkan <strong>Code.gs v5</strong>. Buka Tab <strong>Google Sheets</strong>, salin kode v5, lalu pilih <strong>Deploy &rarr; Manage deployments &rarr; Edit &rarr; New version &rarr; Deploy</strong>.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('sheets')}
+                  className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-xl transition shrink-0"
+                >
+                  Update Code.gs ke v5
+                </button>
+              </div>
+            )}
             
             {/* Top Podium 3 Besar */}
             <div className="bg-gradient-to-b from-blue-900 to-indigo-950 text-white rounded-3xl p-6 shadow-xl relative overflow-hidden">
@@ -1025,14 +1201,27 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
                     Nilai otomatis terhitung dan peringkat bergeser langsung saat siswa submit jawaban di HP/laptop
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setProjectorMode(true)}
-                  className="px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs rounded-xl shadow-lg flex items-center gap-1.5"
-                >
-                  <Maximize2 className="w-4 h-4" />
-                  <span>Mode Panggung Proyektor</span>
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onRefreshState();
+                      showToast('Memperbarui papan skor live...');
+                    }}
+                    className="px-3.5 py-2 bg-white/15 hover:bg-white/25 text-white font-bold text-xs rounded-xl border border-white/20 flex items-center gap-1.5 transition"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Segarkan Live</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setProjectorMode(true)}
+                    className="px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs rounded-xl shadow-lg flex items-center gap-1.5"
+                  >
+                    <Maximize2 className="w-4 h-4" />
+                    <span>Mode Panggung Proyektor</span>
+                  </button>
+                </div>
               </div>
 
               {/* Podium Visual */}
@@ -1082,15 +1271,61 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
 
             </div>
 
+            {/* Menu Hapus Skor & Peringkat */}
+            <div className="bg-white rounded-3xl p-5 border border-slate-200 shadow-sm flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+              <div>
+                <h4 className="font-bold text-sm text-slate-900 flex items-center gap-2">
+                  <Trash2 className="w-4 h-4 text-red-600" />
+                  <span>Menu Hapus Skor & Peringkat</span>
+                </h4>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Kosongkan skor dan peringkat babak aktif atau semua babak untuk uji coba ulang tanpa menghapus data peserta maupun bank soal.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  disabled={actionLoading}
+                  onClick={() => handleClearScoresAndRankings(activeStageId)}
+                  className="px-4 py-2 bg-amber-50 hover:bg-amber-100 disabled:opacity-50 text-amber-800 border border-amber-300 rounded-xl text-xs font-bold flex items-center gap-1.5 transition"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Hapus Skor Babak Ini ({stages[activeStageId]?.name})</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={actionLoading}
+                  onClick={() => handleClearScoresAndRankings('all')}
+                  className="px-4 py-2 bg-red-50 hover:bg-red-100 disabled:opacity-50 text-red-700 border border-red-200 rounded-xl text-xs font-bold flex items-center gap-1.5 transition"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Hapus Semua Skor & Peringkat</span>
+                </button>
+              </div>
+            </div>
+
             {/* Complete Ranking Table */}
             <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
-              <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
-                <h4 className="font-bold text-sm text-slate-800">
-                  Daftar Peringkat Lengkap ({leaderboard.length} Peserta)
-                </h4>
-                <span className="text-xs text-slate-500">
-                  Diurutkan berdasarkan Skor Tertinggi & Waktu Selesai
-                </span>
+              <div className="px-6 py-4 border-b border-slate-100 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h4 className="font-bold text-sm text-slate-800">
+                    Daftar Peringkat Lengkap ({leaderboard.length} Peserta)
+                  </h4>
+                  <span className="text-xs text-slate-500">
+                    Diurutkan berdasarkan Skor Tertinggi, Aktivitas Login &amp; Waktu Selesai
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 text-[11px] font-bold">
+                  <span className="px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200">
+                    Sudah Login: {leaderboard.filter(r => r.hasLoggedIn || r.totalAnswered > 0 || r.totalScore > 0).length}/{leaderboard.length}
+                  </span>
+                  <span className="px-2.5 py-1 rounded-lg bg-blue-50 text-blue-700 border border-blue-200">
+                    Menjawab: {leaderboard.filter(r => r.totalAnswered > 0).length}
+                  </span>
+                  <span className="px-2.5 py-1 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
+                    Selesai: {leaderboard.filter(r => r.isFinished).length}
+                  </span>
+                </div>
               </div>
 
               <div className="overflow-x-auto">
@@ -1101,13 +1336,25 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
                       <th className="px-5 py-3">No Peserta</th>
                       <th className="px-5 py-3">Nama Siswa</th>
                       <th className="px-5 py-3">Asal Sekolah</th>
+                      <th className="px-5 py-3">Status Live</th>
                       <th className="px-5 py-3">Soal Terjawab</th>
                       <th className="px-5 py-3">Total Skor</th>
+                      <th className="px-5 py-3 text-right">Aksi</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {leaderboard.map((r) => {
                       const isTop3 = r.rank <= 3;
+                      const hasScoreOrAnswers = r.totalScore > 0 || r.totalAnswered > 0;
+                      const isLoggedIn = Boolean(r.hasLoggedIn || r.totalAnswered > 0 || r.totalScore > 0);
+                      const lastSeenLabel =
+                        r.lastUpdatedAt && r.lastUpdatedAt > 0
+                          ? new Date(r.lastUpdatedAt).toLocaleTimeString('id-ID', {
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              second: '2-digit'
+                            })
+                          : '';
                       return (
                         <tr
                           key={r.studentId}
@@ -1134,11 +1381,48 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
                           <td className="px-5 py-3.5 text-slate-600">
                             {r.sekolah}
                           </td>
+                          <td className="px-5 py-3.5">
+                            {r.isFinished ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-emerald-100 text-emerald-800 text-[11px] font-bold">
+                                Selesai{lastSeenLabel ? ` · ${lastSeenLabel}` : ''}
+                              </span>
+                            ) : r.totalAnswered > 0 ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-blue-100 text-blue-800 text-[11px] font-bold">
+                                Mengerjakan{lastSeenLabel ? ` · ${lastSeenLabel}` : ''}
+                              </span>
+                            ) : isLoggedIn ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-sky-100 text-sky-800 text-[11px] font-bold">
+                                Sudah Login{lastSeenLabel ? ` · ${lastSeenLabel}` : ''}
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-100 text-slate-400 text-[11px] font-medium">
+                                Belum Login
+                              </span>
+                            )}
+                          </td>
                           <td className="px-5 py-3.5 text-slate-600">
                             {r.totalAnswered} Soal
                           </td>
                           <td className="px-5 py-3.5 font-black text-base text-amber-600">
                             {r.totalScore} Poin
+                          </td>
+                          <td className="px-5 py-3.5 text-right">
+                            {hasScoreOrAnswers ? (
+                              <button
+                                type="button"
+                                disabled={actionLoading}
+                                onClick={() => handleDeleteStudentScore(r)}
+                                className="px-2.5 py-1.5 bg-red-50 hover:bg-red-100 disabled:opacity-50 text-red-700 border border-red-200 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 transition"
+                                title={`Hapus skor ${r.nama}`}
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>Hapus Skor</span>
+                              </button>
+                            ) : (
+                              <span className="text-[11px] text-slate-400 font-medium">
+                                Belum ada skor
+                              </span>
+                            )}
                           </td>
                         </tr>
                       );
@@ -1151,7 +1435,34 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
           </div>
         )}
 
-        {/* TAB 5: PUBLIKASI NETLIFY & SINKRONISASI SERVER */}
+        {/* TAB 5: DATABASE GOOGLE DRIVE (GOOGLE SHEETS & APPSHEET) */}
+        {activeTab === 'sheets' && (
+          <div className="space-y-6">
+            <GoogleSheetsDatabaseCard
+              activeStageId={activeStageId}
+              stages={stages}
+              students={students}
+              questions={questions}
+              leaderboard={leaderboard}
+              onRefreshState={onRefreshState}
+              showToast={showToast}
+              onRequestConfirm={(req) =>
+                setConfirmModal({
+                  isOpen: true,
+                  title: req.title,
+                  message: req.message,
+                  confirmText: req.confirmText,
+                  onConfirm: async () => {
+                    setConfirmModal(null);
+                    await req.onConfirm();
+                  }
+                })
+              }
+            />
+          </div>
+        )}
+
+        {/* TAB 6: PUBLIKASI NETLIFY & SINKRONISASI SERVER */}
         {activeTab === 'deploy' && (
           <div className="space-y-6">
             
@@ -1160,13 +1471,25 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
               <div className="relative z-10 max-w-3xl">
                 <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 mb-3">
                   <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Cloud Database Realtime Firebase Firestore Aktif</span>
+                  <span>
+                    {isGoogleSheetsPrimaryActive()
+                      ? 'Database Utama Ujian Siswa: Google Sheets & AppSheet Aktif'
+                      : 'Cloud Database Realtime Firebase Firestore Aktif'}
+                  </span>
                 </div>
                 <h2 className="text-2xl sm:text-3xl font-black tracking-wide">
                   Pusat Sinkronisasi Realtime & Publikasi Netlify
                 </h2>
                 <p className="text-sm text-sky-100 mt-2 leading-relaxed">
-                  Aplikasi telah terhubung ke <strong>Firebase Cloud Firestore</strong>! Sekarang perubahan babak di laptop panitia <strong>langsung berubah secara realtime di HP seluruh siswa</strong>, dan setiap jawaban/skor yang dikerjakan siswa di HP <strong>langsung muncul seketika di papan skor / proyektor laptop panitia</strong> tanpa perlu refresh!
+                  {isGoogleSheetsPrimaryActive() ? (
+                    <>
+                      Aplikasi sedang berjalan penuh di <strong>Google Sheets (AppSheet Ready)</strong>! Seluruh aktivitas login siswa, pemuatan soal, penyimpanan jawaban (<code className="bg-white/15 px-1 rounded">Jawaban_Detail</code>), dan peringkat live disinkronkan langsung antara HP siswa dan Google Spreadsheet Anda.
+                    </>
+                  ) : (
+                    <>
+                      Aplikasi telah terhubung ke <strong>Firebase Cloud Firestore</strong>! Sekarang perubahan babak di laptop panitia <strong>langsung berubah secara realtime di HP seluruh siswa</strong>, dan setiap jawaban/skor yang dikerjakan siswa di HP <strong>langsung muncul seketika di papan skor / proyektor laptop panitia</strong> tanpa perlu refresh!
+                    </>
+                  )}
                 </p>
               </div>
               <div className="absolute -right-10 -bottom-10 w-72 h-72 bg-amber-400/10 rounded-full blur-3xl pointer-events-none" />
@@ -1183,10 +1506,12 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
                   <div className="text-xs font-bold text-emerald-800 uppercase tracking-wider mb-1">Database Cloud Realtime</div>
                   <div className="text-base font-black text-emerald-950 flex items-center gap-1.5">
                     <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-                    <span>Firebase Firestore Online</span>
+                    <span>{isGoogleSheetsPrimaryActive() ? 'Google Sheets Engine Online' : 'Firebase Firestore Online'}</span>
                   </div>
                   <p className="text-[11px] text-emerald-700 mt-1">
-                    Sinkronisasi otomatis antar-perangkat (Laptop Panitia ⟷ HP Siswa) via cloud stream.
+                    {isGoogleSheetsPrimaryActive()
+                      ? 'Seluruh aktivitas ujian 164 siswa langsung tersimpan ke Google Sheets & AppSheet.'
+                      : 'Sinkronisasi otomatis antar-perangkat (Laptop Panitia ⟷ HP Siswa) via cloud stream.'}
                   </p>
                 </div>
 
@@ -1212,7 +1537,7 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
                   <div className="text-xs font-bold text-amber-800 uppercase tracking-wider mb-1">Live Cloud Stream</div>
                   <div className="text-base font-black text-amber-950 flex items-center gap-1.5">
                     <Radio className="w-4 h-4 text-amber-600 animate-pulse" />
-                    <span>onSnapshot Active (0 Detik Delay)</span>
+                    <span>{isGoogleSheetsPrimaryActive() ? 'Apps Script Lock & Cache Aktif' : 'onSnapshot Active (0 Detik Delay)'}</span>
                   </div>
                   <div className="mt-2 flex items-center gap-2">
                     <button
@@ -1365,24 +1690,40 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
                 <div className="mt-5 pt-4 border-t border-slate-100 flex flex-wrap gap-2">
                   <button
                     type="button"
-                    onClick={() => copyToClipboard(`1. Ekstrak file zip di komputer.
-2. Buka terminal di folder proyek, jalankan: npm install && npm run build
-3. Buka app.netlify.com/drop di browser.
-4. Drag & drop HANYA folder 'dist' ke kotak Netlify Drop.
-5. Selesai! Web langsung live dan dapat link yang bisa dibuka siswa.`, 'drop_steps')}
+                    disabled={downloadingSingleHtml}
+                    onClick={handleDownloadSingleHtml}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 transition shadow"
+                  >
+                    <FileText className="w-4 h-4" />
+                    <span>{downloadingSingleHtml ? 'Menyiapkan index.html...' : 'Unduh index.html Tunggal (1 File Siap Pakai)'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={downloadingDistZip}
+                    onClick={handleDownloadNetlifyZip}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 transition shadow"
+                  >
+                    <DownloadCloud className="w-4 h-4" />
+                    <span>{downloadingDistZip ? 'Menyiapkan ZIP...' : 'Unduh Paket Siap Netlify (.zip)'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(`1. Klik tombol "Unduh index.html Tunggal (1 File Siap Pakai)" atau "Unduh Paket Siap Netlify (.zip)".
+2. index.html sudah berisi seluruh aplikasi + URL Google Sheets aktif di dalamnya (langsung sinkron realtime antar HP siswa, Google Sheets, dan Laptop Panitia).
+3. Unggah folder/zip tersebut ke Netlify Deploys atau buka index.html langsung di browser.`, 'drop_steps')}
                     className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl font-bold text-xs flex items-center gap-1.5 transition"
                   >
                     {copiedKey === 'drop_steps' ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
-                    <span>{copiedKey === 'drop_steps' ? 'Tersalin!' : 'Salin Instruksi Netlify Drop'}</span>
+                    <span>{copiedKey === 'drop_steps' ? 'Tersalin!' : 'Salin Instruksi'}</span>
                   </button>
                   <a
-                    href="https://app.netlify.com/drop"
+                    href="https://app.netlify.com/sites/elegant-piroshki-d8fe8a/deploys"
                     target="_blank"
                     rel="noreferrer"
                     className="px-3.5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-xl font-bold text-xs flex items-center gap-1.5 transition shadow"
                   >
                     <ExternalLink className="w-4 h-4" />
-                    <span>Buka Netlify Drop</span>
+                    <span>Buka Netlify Deploys</span>
                   </a>
                 </div>
               </div>
@@ -1500,7 +1841,7 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
           <div className="flex items-center justify-between border-b border-white/20 pb-4">
             <div className="flex items-center gap-3">
               <img 
-                src="/assets/aistudio/WhatsApp_Image_2026-11-04_at_10.53.59_691c768a.jpeg" 
+                src={geloraBannerImg} 
                 alt="Gelora 26" 
                 className="w-14 h-14 object-cover rounded-2xl border-2 border-amber-400"
               />
@@ -1618,17 +1959,19 @@ export const PanitiaDashboard: React.FC<PanitiaDashboardProps> = ({
             <div className="flex items-center justify-end gap-3">
               <button
                 type="button"
+                disabled={actionLoading}
                 onClick={() => setConfirmModal(null)}
-                className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 font-bold text-xs hover:bg-slate-100 transition"
+                className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 font-bold text-xs hover:bg-slate-100 disabled:opacity-50 transition"
               >
                 Batal
               </button>
               <button
                 type="button"
+                disabled={actionLoading}
                 onClick={confirmModal.onConfirm}
-                className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-lg transition"
+                className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-xs shadow-lg transition"
               >
-                {confirmModal.confirmText || 'Konfirmasi'}
+                {actionLoading ? 'Memproses...' : (confirmModal.confirmText || 'Konfirmasi')}
               </button>
             </div>
           </div>

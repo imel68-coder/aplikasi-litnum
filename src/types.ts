@@ -108,6 +108,9 @@ export interface LeaderboardRank {
   totalAnswered: number;
   correctCount: number;
   lastSubmitTime?: number;
+  hasLoggedIn?: boolean;
+  isFinished?: boolean;
+  lastUpdatedAt?: number;
 }
 
 export interface AppDatabaseState {

@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { Question, StageId, Student, LeaderboardRank } from '../../types';
 import { submitStudentAnswer, finishStudentStage, getStudentStageSubmissions, saveLocalStudentDraft } from '../../services/api';
+import geloraBannerImg from '../../assets/banner';
 
 interface SiswaExamViewProps {
   student: Student;
@@ -117,17 +118,31 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
       .catch(() => {});
   }, [activeStageId, student.id]);
 
-  // Real-time synchronization when leaderboard prop updates from Firestore
+  // Real-time synchronization when leaderboard prop updates from Google Sheets / Firestore
   useEffect(() => {
     if (leaderboard && leaderboard.length > 0) {
       setStageLeaderboard(leaderboard);
       const myRank = leaderboard.find(r => r.studentId === student.id);
       if (myRank) {
         setMyFinalRank(myRank);
-        setCurrentScore(prev => (myRank.totalScore > prev ? myRank.totalScore : prev));
+        if (myRank.totalScore === 0 && myRank.totalAnswered === 0 && (currentScore > 0 || submittedQuestionIds.length > 0)) {
+          getStudentStageSubmissions(student.id, activeStageId)
+            .then(res => {
+              if ((res.submittedQuestionIds?.length || 0) === 0 && (res.totalScore || 0) === 0) {
+                setAnswers({});
+                setSubmittedQuestionIds([]);
+                setCurrentScore(0);
+                setIsStageFinished(false);
+                setShowQuestionResultModal(false);
+              }
+            })
+            .catch(() => {});
+        } else {
+          setCurrentScore(prev => (myRank.totalScore > prev ? myRank.totalScore : prev));
+        }
       }
     }
-  }, [leaderboard, student.id]);
+  }, [leaderboard, student.id, activeStageId, currentScore, submittedQuestionIds.length]);
 
   // Trigger celebration confetti when stage finishes
   useEffect(() => {
@@ -258,7 +273,7 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
           <div className="max-w-4xl mx-auto flex items-center justify-between">
             <div className="flex items-center gap-3">
               <img 
-                src="/assets/aistudio/WhatsApp_Image_2026-11-04_at_10.53.59_691c768a.jpeg" 
+                src={geloraBannerImg} 
                 alt="Gelora 26" 
                 className="w-10 h-10 object-cover rounded-xl border border-white/20"
               />
@@ -421,7 +436,7 @@ export const SiswaExamView: React.FC<SiswaExamViewProps> = ({
           {/* Logo & Student Info */}
           <div className="flex items-center gap-3">
             <img 
-              src="/assets/aistudio/WhatsApp_Image_2026-11-04_at_10.53.59_691c768a.jpeg" 
+              src={geloraBannerImg} 
               alt="Gelora 26" 
               className="w-10 h-10 object-cover rounded-xl border border-white/20 shrink-0"
             />

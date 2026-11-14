@@ -1,19 +1,24 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { LogIn, Sparkles, User, ShieldCheck, School, Trophy, Award, BookOpen, Calculator, CheckCircle2, Globe, Wifi, Search, Users, Bell } from 'lucide-react';
+import { LogIn, Sparkles, User, ShieldCheck, School, Trophy, Award, BookOpen, Calculator, CheckCircle2, Globe, Wifi, Search, Users, Bell, RefreshCw } from 'lucide-react';
 import { Student } from '../types';
 import { loginUser, getServerStatus } from '../services/api';
+import { isGoogleSheetsPrimaryActive } from '../services/googleSheetsDb';
+import geloraBannerImg from '../assets/banner';
 
 interface LoginPageProps {
   onLoginSuccess: (user: any, role: 'admin' | 'student') => void;
   students: Student[];
   activeStageName: string;
+  onRefreshStudents?: () => Promise<void> | void;
 }
 
 export const LoginPage: React.FC<LoginPageProps> = ({
   onLoginSuccess,
   students,
-  activeStageName
+  activeStageName,
+  onRefreshStudents
 }) => {
+  const [refreshingStudents, setRefreshingStudents] = useState(false);
   const [activeTab, setActiveTab] = useState<'student' | 'admin'>('student');
   const [noPeserta, setNoPeserta] = useState('');
   const [pin, setPin] = useState('1234');
@@ -37,7 +42,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
     prevCountRef.current = students.length;
   }, [students]);
 
-  const bannerImageUrl = '/assets/aistudio/WhatsApp_Image_2026-11-04_at_10.53.59_691c768a.jpeg';
+  const bannerImageUrl = geloraBannerImg;
 
   const handleStudentLogin = async (customNo?: string, customPin?: string) => {
     setErrorMsg('');
@@ -126,12 +131,33 @@ export const LoginPage: React.FC<LoginPageProps> = ({
 
           {/* Role Tabs & Realtime Indicator */}
           <div className="p-4 sm:p-6 pt-4">
-            <div className="flex items-center justify-between mb-3.5 px-1 text-xs text-slate-500">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3.5 px-1 text-xs text-slate-500">
               <span className="inline-flex items-center gap-1.5 font-medium text-emerald-800 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200 text-[11px]">
                 <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                <span>Cloud Realtime: {students.length} Siswa Terdaftar</span>
+                <span>
+                  {isGoogleSheetsPrimaryActive() ? 'Google Sheets' : 'Cloud Realtime'}: {students.length} Siswa Terdaftar
+                </span>
               </span>
-              <span className="text-[11px] font-mono text-slate-500">SMPN 26 Sijunjung</span>
+              {onRefreshStudents ? (
+                <button
+                  type="button"
+                  disabled={refreshingStudents}
+                  onClick={async () => {
+                    setRefreshingStudents(true);
+                    try {
+                      await onRefreshStudents();
+                    } finally {
+                      setRefreshingStudents(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1 text-[11px] font-bold text-blue-600 hover:text-blue-800 bg-blue-50 hover:bg-blue-100 px-2.5 py-1 rounded-full border border-blue-200 transition disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3 h-3 ${refreshingStudents ? 'animate-spin' : ''}`} />
+                  <span>{refreshingStudents ? 'Memuat...' : 'Segarkan Data'}</span>
+                </button>
+              ) : (
+                <span className="text-[11px] font-mono text-slate-500">SMPN 26 Sijunjung</span>
+              )}
             </div>
 
             {/* Realtime student added notification banner */}
@@ -202,13 +228,13 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                       type="text"
                       required
                       list="registered-students-list"
-                      placeholder="Contoh: G26-001"
+                      placeholder="Contoh: G26-01 atau G26-001"
                       value={noPeserta}
                       onChange={(e) => setNoPeserta(e.target.value.toUpperCase())}
                       className="w-full px-4 py-3 bg-slate-50 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:bg-white text-slate-900 font-semibold tracking-wider outline-none text-sm transition"
                     />
                     <span className="absolute right-3 top-3 text-xs bg-slate-200 text-slate-600 px-2 py-0.5 rounded font-mono">
-                      G26-XXX
+                      G26-XX
                     </span>
                   </div>
                   {/* HTML5 datalist for auto-completion from realtime student list */}

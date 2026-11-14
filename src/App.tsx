@@ -7,6 +7,7 @@ import { CloudErrorKind } from './services/firebase';
 import { LeaderboardRank, Question, StageId, Student, UserRole } from './types';
 import { initialStages, initialStudents, initialQuestions } from './seedData';
 import { AlertTriangle, RefreshCw, ExternalLink } from 'lucide-react';
+import geloraBannerImg from './assets/banner';
 
 function readStoredUser(): any {
   try {
@@ -175,7 +176,7 @@ export default function App() {
       <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-4 text-center">
         <div className="w-16 h-16 rounded-2xl overflow-hidden mb-4 shadow-xl border-2 border-amber-400 animate-pulse">
           <img
-            src="/assets/aistudio/WhatsApp_Image_2026-11-04_at_10.53.59_691c768a.jpeg"
+            src={geloraBannerImg}
             alt="GELORA 26"
             className="w-full h-full object-cover"
           />
@@ -230,6 +231,7 @@ export default function App() {
             onLoginSuccess={handleLoginSuccess}
             students={students}
             activeStageName={stages[activeStageId]?.name || 'Babak Penyisihan'}
+            onRefreshStudents={() => loadState(null)}
           />
         </div>
       </div>

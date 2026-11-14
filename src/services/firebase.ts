@@ -1,4 +1,5 @@
 import { initializeApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
 import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
 import {
   getFirestore as getFirestoreLite,
@@ -15,11 +16,16 @@ import firebaseConfig from '../../firebase-applet-config.json';
 import { initialQuestions, initialStages, initialStudents } from '../seedData';
 
 // Initialize Firebase App
-const app = initializeApp(firebaseConfig);
+export const app = initializeApp(firebaseConfig);
+export const auth = getAuth(app);
+
+export const FIRESTORE_DATABASE_ID =
+  (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId ||
+  'ai-studio-remixgelora26lom-27d71874-5d97-4641-9dcc-154ea1707e4d';
 
 // CRITICAL: Connect both full SDK (realtime onSnapshot) & Lite REST SDK (resilient fallback) to specified firestoreDatabaseId
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
-export const dbLite = getFirestoreLite(app, firebaseConfig.firestoreDatabaseId);
+export const db = getFirestore(app, FIRESTORE_DATABASE_ID);
+export const dbLite = getFirestoreLite(app, FIRESTORE_DATABASE_ID);
 
 export enum OperationType {
   CREATE = 'create',
